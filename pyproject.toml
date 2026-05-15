@@ -64,7 +64,7 @@ srwpy = ">=4.1"
 [tool.pixi.pypi-dependencies]
 diffman = { path = ".", editable = true }
 fastapi = ">=0.110"
-"uvicorn[standard]" = ">=0.27"
+uvicorn = { version = ">=0.27", extras = ["standard"] }
 watchdog = ">=4.0"
 plotly = ">=5.18"
 

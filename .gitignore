@@ -29,3 +29,4 @@ htmlcov/
 
 # diffman runtime
 runs/
+.env/
