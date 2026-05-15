@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>diffman</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js" charset="utf-8"></script>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="sidebar-header">
+      <h1>diffman</h1>
+      <span id="ws-status" class="ws-dot" title="WebSocket"></span>
+    </div>
+    <section>
+      <div class="row">
+        <input id="scan-root" type="text" placeholder="scan root (default cwd)">
+        <button onclick="App.scan()">Scan</button>
+      </div>
+      <h2>Pipelines</h2>
+      <div id="modules"></div>
+    </section>
+    <section>
+      <h2>Runs</h2>
+      <div id="runs"></div>
+    </section>
+  </aside>
+  <main id="main">
+    <h2>diffman</h2>
+    <p class="hint">Pick a pipeline or a run on the left.</p>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

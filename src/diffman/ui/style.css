@@ -1,0 +1,127 @@
+:root {
+  --bg: #14181d;
+  --panel: #1f2933;
+  --panel2: #2a3540;
+  --line: #323f4b;
+  --text: #cbd2d9;
+  --muted: #9aa5b1;
+  --accent: #7fb3d5;
+  --accent-hover: #b3d4ec;
+  --ok: #27ae60;
+  --info: #2980b9;
+  --warn: #e67e22;
+  --err: #c0392b;
+  --neutral: #7f8c8d;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; color: var(--text); background: var(--bg); }
+
+#app { display: grid; grid-template-columns: 300px 1fr; height: 100vh; }
+
+#sidebar {
+  background: var(--panel); overflow: auto; padding: 12px 14px;
+  border-right: 1px solid var(--line);
+}
+.sidebar-header {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+}
+.sidebar-header h1 { margin: 0; font-size: 18px; }
+.ws-dot {
+  width: 9px; height: 9px; border-radius: 50%; background: var(--neutral);
+}
+.ws-dot.connected { background: var(--ok); }
+.ws-dot.error { background: var(--err); }
+
+#sidebar h2 {
+  font-size: 11px; margin: 14px 0 4px;
+  color: var(--muted); text-transform: uppercase; letter-spacing: .5px;
+}
+#sidebar .row { display: flex; gap: 4px; margin-bottom: 8px; }
+#sidebar input[type=text] {
+  flex: 1; background: var(--panel2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px;
+  font: inherit;
+}
+#sidebar button {
+  background: var(--info); color: #fff; border: 0; border-radius: 4px;
+  padding: 4px 10px; cursor: pointer; font: inherit;
+}
+#sidebar button:hover { background: #1f6a9c; }
+#sidebar a {
+  color: var(--accent); text-decoration: none; display: block;
+  padding: 2px 0; font-size: 13px;
+}
+#sidebar a:hover { color: var(--accent-hover); }
+#sidebar .group {
+  font-size: 11px; color: var(--muted); margin: 6px 0 2px;
+  text-transform: uppercase; letter-spacing: .5px;
+}
+#sidebar .modgroup {
+  padding-left: 8px; border-left: 2px solid var(--line); margin-left: 2px;
+}
+.hint { color: var(--muted); font-size: 12px; }
+
+#main {
+  background: #fafafa; color: #222; padding: 18px 26px; overflow: auto;
+}
+#main h2 { margin-top: 0; }
+#main code, #main pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+#main pre {
+  background: #f1f3f4; padding: 8px 12px; overflow: auto; border-radius: 4px;
+}
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+button.main {
+  background: var(--info); color: #fff; border: 0; border-radius: 4px;
+  padding: 6px 14px; cursor: pointer; font: inherit;
+}
+button.main:hover { background: #1f6a9c; }
+button.ghost {
+  background: transparent; color: var(--info); border: 1px solid var(--info);
+  border-radius: 4px; padding: 4px 10px; cursor: pointer; font: inherit;
+}
+.badge {
+  display: inline-block; padding: 1px 8px; border-radius: 3px;
+  font-size: 11px; color: #fff; background: var(--neutral);
+}
+.badge.done    { background: var(--ok); }
+.badge.cached  { background: var(--info); }
+.badge.skipped { background: var(--neutral); }
+.badge.failed  { background: var(--err); }
+.badge.running { background: var(--warn); }
+
+.stage-row {
+  display: grid; grid-template-columns: 140px 80px 1fr; gap: 8px;
+  padding: 6px 0; border-bottom: 1px solid #ddd; align-items: center;
+}
+.stage-row:last-child { border-bottom: 0; }
+.stage-row .name { font-weight: 600; }
+.stage-row .key { font-family: ui-monospace, Menlo, monospace;
+                  font-size: 11px; color: #888; }
+
+.artifact {
+  border: 1px solid #ddd; border-radius: 4px;
+  margin: 8px 0; padding: 8px 12px; background: #fff;
+}
+.artifact .header {
+  display: flex; gap: 12px; align-items: center; font-size: 13px;
+  margin-bottom: 6px; color: #555;
+}
+.artifact .header .path { font-family: ui-monospace, monospace; color: #222; }
+.artifact .header .meta { color: #888; }
+.artifact .body img { max-width: 100%; }
+.artifact .body pre { max-height: 320px; }
+
+.plot { width: 100%; min-height: 380px; }
+
+#overrides {
+  width: 100%; min-height: 80px; font: inherit; padding: 6px 8px;
+  border: 1px solid #ccc; border-radius: 4px;
+  font-family: ui-monospace, monospace; font-size: 12px;
+}
+
+table.kv { border-collapse: collapse; font-size: 13px; }
+table.kv td { padding: 2px 8px 2px 0; vertical-align: top; }
+table.kv td.k { color: #888; }
