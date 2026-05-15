@@ -32,15 +32,55 @@ async function jpost(url, body) {
   return r.json();
 }
 
+const SBATCH_LS_KEY = 'diffman.sbatch_flags';
+
 const App = {
   current: null,         // {kind: 'module'|'run'|'stage', ...}
   ws: null,
   runs: [],
+  submitter: null,       // {kind, accepts_sbatch_flags, default_sbatch_flags}
 
   async init() {
     this.connectWS();
+    try { this.submitter = await jget('/api/submitter'); } catch (_) {}
     await this.refresh();
     setInterval(() => this.refresh(), 7000);
+  },
+
+  // Read/write the persisted sbatch flag string (browser localStorage).
+  sbatchFlags() {
+    return localStorage.getItem(SBATCH_LS_KEY) || '';
+  },
+  setSbatchFlags(s) {
+    try { localStorage.setItem(SBATCH_LS_KEY, s); } catch (_) {}
+  },
+
+  // Build an sbatch-flags row to drop above a Launch button. Returns
+  // null if the active submitter doesn't accept them (local).
+  sbatchRow() {
+    if (!this.submitter || !this.submitter.accepts_sbatch_flags) return null;
+    const input = el('input', {
+      type: 'text', id: 'sbatch-flags', class: 'sbatch-flags',
+      placeholder: '--partition=regular --nodes=1 --time=01:00:00',
+      value: this.sbatchFlags(),
+    });
+    input.oninput = () => this.setSbatchFlags(input.value);
+    const defaults = (this.submitter.default_sbatch_flags || []).join(' ');
+    const row = el('div', {class: 'sbatch-row'}, [
+      el('label', {class: 'sbatch-label', text: 'sbatch flags:'}),
+      input,
+    ]);
+    if (defaults) {
+      row.appendChild(el('div', {class: 'hint sbatch-hint',
+        text: `server defaults (always applied): ${defaults}`}));
+    }
+    return row;
+  },
+
+  // Pull the current sbatch flag string for inclusion in a launch payload.
+  currentSbatchFlags() {
+    const inp = document.getElementById('sbatch-flags');
+    return inp ? inp.value : this.sbatchFlags();
   },
 
   connectWS() {
@@ -143,6 +183,20 @@ const App = {
       return;
     }
 
+    const actions = el('div', {class: 'row', style: 'margin-bottom:8px'}, [
+      el('button', {class: 'ghost', text: 'View / edit script',
+        onclick: () => this.showScript(module)}),
+      el('button', {class: 'ghost', text: 'Fork script',
+        onclick: () => this.forkScriptPrompt(module)}),
+    ]);
+    main.appendChild(actions);
+
+    if (data.variants.length === 0) {
+      main.appendChild(el('p', {class: 'hint',
+        text: '(this module registered no variants — check the dm.register() calls)'}));
+    }
+    const sb = this.sbatchRow();
+    if (sb) main.appendChild(sb);
     const tbl = el('table', {class: 'kv'});
     for (const v of data.variants) {
       tbl.appendChild(el('tr', {}, [
@@ -150,30 +204,56 @@ const App = {
         el('td', {}, [
           el('button', {class: 'main', text: 'Launch',
                         onclick: () => this.launch(module, v, [], null)}),
+          el('button', {class: 'ghost', text: 'Configure & launch',
+                        onclick: () => this.showLaunchForm(module, v)}),
           el('button', {class: 'ghost', text: 'Describe',
                         onclick: () => this.describe(module, v)}),
         ]),
       ]));
     }
     main.appendChild(tbl);
+  },
 
-    main.appendChild(el('h3', {text: 'Custom launch (fork)'}));
-    const sel = el('select', {id: 'fork-base'});
-    for (const v of data.variants)
-      sel.appendChild(el('option', {value: v, text: v}));
-    const only = el('input', {type: 'text', id: 'only',
-                              placeholder: '--only stage,stage  (optional)',
-                              style: 'flex:1'});
-    main.appendChild(el('div', {class: 'row'}, [sel, only]));
-    main.appendChild(el('textarea', {id: 'overrides',
-                                     placeholder: 'overrides, one per line, e.g.\n  detector.apply_noise=true\n  scan.width=1e-6'}));
-    main.appendChild(el('button', {class: 'main', text: 'Launch with overrides',
-                                   onclick: () => {
-                                     const ovr = $('#overrides').value.split('\n')
-                                       .map(s => s.trim()).filter(Boolean);
-                                     this.launch(module, sel.value, ovr,
-                                                 only.value.trim() || null);
-                                   }}));
+  async showLaunchForm(module, variant) {
+    const main = $('#main'); main.innerHTML = '';
+    main.appendChild(el('h2', {text: `Launch — ${module} / ${variant}`}));
+    main.appendChild(el('p', {class: 'hint',
+      text: 'Tweak any field below to launch with config overrides. ' +
+            'Leaving everything unchanged is equivalent to a plain Launch. ' +
+            'Each unique override set gets its own run directory.'}));
+
+    let desc;
+    try {
+      desc = await jget('/api/describe?' +
+        new URLSearchParams({module, variant}));
+    } catch (e) {
+      main.appendChild(el('pre', {text: 'describe failed: ' + e}));
+      return;
+    }
+
+    const overrides = {};  // dotted-path -> {value, originalType}
+    const formDiv = el('div', {class: 'cfg-form'});
+    renderConfigEditor(formDiv, desc.config, '', overrides);
+    main.appendChild(formDiv);
+
+    const onlyInput = el('input', {type: 'text',
+      placeholder: 'only stages (comma-separated, optional)',
+      style: 'flex:1'});
+    main.appendChild(el('div', {class: 'row', style: 'margin-top:8px'},
+      [el('label', {text: 'only: '}), onlyInput]));
+
+    const sb = this.sbatchRow();
+    if (sb) main.appendChild(sb);
+
+    main.appendChild(el('button', {class: 'main',
+      text: 'Launch', style: 'margin-top:8px',
+      onclick: () => {
+        const ovr = [];
+        for (const [path, info] of Object.entries(overrides)) {
+          if (info.dirty) ovr.push(`${path}=${info.literal}`);
+        }
+        this.launch(module, variant, ovr, onlyInput.value.trim() || null);
+      }}));
   },
 
   async describe(module, variant, overrides) {
@@ -188,11 +268,75 @@ const App = {
     main.appendChild(el('pre', {text: JSON.stringify(d.config, null, 2)}));
   },
 
+  async showScript(module) {
+    const main = $('#main'); main.innerHTML = '';
+    main.appendChild(el('h2', {text: `Script — ${module}.py`}));
+    let d;
+    try { d = await jget('/api/script?module=' + encodeURIComponent(module)); }
+    catch (e) {
+      main.appendChild(el('pre', {text: 'load failed: ' + e}));
+      return;
+    }
+    main.appendChild(el('p', {class: 'hint', text: d.path}));
+    if (d.fork) {
+      main.appendChild(el('p', {class: 'hint',
+        text: `forked from ${d.fork.parent_module} on ${d.fork.created}`}));
+    }
+    const ta = el('textarea', {class: 'cfg-script-editor', spellcheck: 'false'});
+    ta.value = d.source;
+    main.appendChild(ta);
+    const status = el('span', {class: 'hint', style: 'margin-left:8px'});
+    main.appendChild(el('div', {class: 'row', style: 'margin-top:8px'}, [
+      el('button', {class: 'main', text: 'Save',
+        onclick: async () => {
+          status.textContent = 'saving…';
+          try {
+            const r = await fetch('/api/script', {
+              method: 'PUT',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({module, source: ta.value}),
+            });
+            const j = await r.json();
+            if (!r.ok) throw new Error(j.detail || r.statusText);
+            status.textContent = `saved ${j.bytes} bytes`;
+          } catch (e) {
+            status.textContent = 'save failed: ' + e;
+          }
+        }}),
+      status,
+    ]));
+  },
+
+  async forkScriptPrompt(parent_module) {
+    const new_name = window.prompt(
+      `Fork ${parent_module}.py — new module name (valid Python identifier):`,
+      `${parent_module}_fork`);
+    if (!new_name) return;
+    try {
+      const r = await fetch('/api/fork_script', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({parent_module, new_name: new_name.trim()}),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.detail || r.statusText);
+      await this.refresh();
+      this.showScript(j.module);
+    } catch (e) {
+      alert('fork failed: ' + e);
+    }
+  },
+
   async launch(module, variant, overrides, only) {
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: 'Launching…'}));
     const body = {module, variant, vars: overrides || []};
     if (only) body.only = only;
+    const sbatch = this.currentSbatchFlags();
+    if (sbatch && this.submitter && this.submitter.accepts_sbatch_flags) {
+      body.sbatch_flags = sbatch;
+      this.setSbatchFlags(sbatch);
+    }
     const info = await jpost('/api/launch', body);
     main.appendChild(el('pre', {text: JSON.stringify(info, null, 2)}));
     setTimeout(() => this.refresh(), 1000);
@@ -490,6 +634,81 @@ const App = {
     }
   },
 };
+
+// Render a typed editor for a (nested) config object. Each leaf gets an
+// input matched to its current value type. Edits are recorded into
+// `overrides` keyed by dotted path; `info.literal` is the Python-literal
+// form expected by /api/launch (parsed by parse_value on the server).
+function renderConfigEditor(container, cfg, prefix, overrides) {
+  for (const [key, val] of Object.entries(cfg)) {
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (val !== null && typeof val === 'object' && !Array.isArray(val)) {
+      const det = document.createElement('details');
+      det.open = prefix === '';   // top-level expanded, nested collapsed
+      const sum = document.createElement('summary');
+      sum.textContent = key;
+      det.appendChild(sum);
+      const inner = el('div', {class: 'cfg-nested'});
+      det.appendChild(inner);
+      container.appendChild(det);
+      renderConfigEditor(inner, val, path, overrides);
+    } else {
+      container.appendChild(renderConfigLeaf(path, key, val, overrides));
+    }
+  }
+}
+
+function renderConfigLeaf(path, key, val, overrides) {
+  const row = el('div', {class: 'cfg-row'});
+  row.appendChild(el('label', {class: 'cfg-key', text: key, title: path}));
+
+  const type = val === null ? 'null'
+    : typeof val === 'boolean' ? 'bool'
+    : typeof val === 'number' ? 'number'
+    : Array.isArray(val) ? 'list'
+    : 'str';
+  row.appendChild(el('span', {class: 'cfg-type', text: type}));
+
+  let input;
+  const record = (literal, dirty) => {
+    overrides[path] = {literal, dirty};
+  };
+  if (type === 'bool') {
+    input = el('input', {type: 'checkbox'});
+    input.checked = val;
+    input.onchange = () => record(input.checked ? 'true' : 'false',
+                                  input.checked !== val);
+  } else if (type === 'number') {
+    input = el('input', {type: 'text', value: String(val)});
+    input.oninput = () => {
+      const t = input.value.trim();
+      record(t, t !== String(val));
+    };
+  } else if (type === 'list') {
+    input = el('input', {type: 'text', value: JSON.stringify(val)});
+    input.oninput = () => {
+      const t = input.value.trim();
+      record(t, t !== JSON.stringify(val));
+    };
+  } else if (type === 'null') {
+    input = el('input', {type: 'text', value: '', placeholder: 'None'});
+    input.oninput = () => {
+      const t = input.value.trim();
+      record(t || 'None', t !== '');
+    };
+  } else {
+    input = el('input', {type: 'text', value: String(val)});
+    input.oninput = () => {
+      const t = input.value;
+      // quote so server parse_value treats it as a string literal,
+      // not as a Python expression.
+      record(JSON.stringify(t), t !== String(val));
+    };
+  }
+  input.classList.add('cfg-input');
+  row.appendChild(input);
+  return row;
+}
 
 function humanSize(n) {
   if (n < 1024) return n + ' B';

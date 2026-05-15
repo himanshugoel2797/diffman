@@ -6,14 +6,18 @@ Routes:
   GET  /api/modules                               → list known modules
   GET  /api/scan?root=<path>                      → re-discover modules
   GET  /api/variants?module=<name>                → variant names for a module
-  GET  /api/describe?module=&variant=&var=...     → resolved config (with forks)
+  GET  /api/describe?module=&variant=&var=...     → resolved config (w/ overrides)
   GET  /api/runs[?pipeline=&variant=]             → all runs
   GET  /api/run/{pipeline}/{variant}/{fp}         → single run detail + stages
   GET  /api/stage/{pipeline}/{variant}/{fp}/{st}  → stage detail + artifact list
   GET  /api/render?path=<abs>                     → renderer payload for a file
   GET  /api/render_dataset?path=&dataset=         → h5 dataset preview
   GET  /artifact/{pipeline}/{variant}/{fp}/{rest} → raw file download
+  GET  /api/submitter                             → submitter kind + defaults
   POST /api/launch                                → submit a run
+  GET  /api/script?module=<name>                  → pipeline .py source + fork sidecar
+  PUT  /api/script   {module, source}             → save edits to a pipeline .py
+  POST /api/fork_script {parent_module, new_name} → copy parent .py to new name
   WS   /ws                                        → push updates (run_changed, etc.)
 """
 
@@ -81,13 +85,19 @@ def parse_overrides(entries) -> dict:
     return out
 
 
-def make_fork(base: Variant, overrides: dict) -> Variant:
+def make_override_variant(base: Variant, overrides: dict) -> Variant:
+    """Build a synthetic Variant carrying inline config overrides.
+
+    Not a script fork — purely a config tweak on top of `base`. Name is
+    `<base>+<short-fp-of-overrides>` so a given override set has a stable
+    run directory. Inherits `module` from base for UI attribution.
+    """
     if not overrides:
         return base
-    fork = Variant(base.name, base, overrides)
+    v = Variant(base.name, base, overrides, module=base.module)
     short = _fp(overrides)[:8]
-    fork.name = f'{base.name}+{short}'
-    return fork
+    v.name = f'{base.name}+{short}'
+    return v
 
 
 def flatten_overrides(d, prefix=''):
@@ -227,6 +237,16 @@ def create_app(*,
         return {'modules': _modules_payload(),
                 'scan_root': os.path.abspath(app.state.scan_root)}
 
+    @app.get('/api/submitter')
+    def _submitter_info():
+        sub = app.state.submitter
+        defaults = getattr(sub, 'sbatch_flags', None)
+        return {
+            'kind': sub.kind,
+            'accepts_sbatch_flags': sub.kind == 'slurm',
+            'default_sbatch_flags': list(defaults) if defaults else [],
+        }
+
     @app.get('/api/scan')
     def _scan(root: Optional[str] = None):
         if root:
@@ -243,7 +263,12 @@ def create_app(*,
         except Exception as e:
             raise HTTPException(status_code=400,
                                 detail=f'import {module}: {e}')
-        names = discovery.module_variants(module) or _global_registry.names()
+        #Prefer authoritative per-Variant module attribution (set at
+        #register() time). Fall back to the import-time diff captured by
+        #discovery.load_module for variants registered before this change.
+        names = _global_registry.for_module(module)
+        if not names:
+            names = discovery.module_variants(module)
         return {'module': module, 'variants': names}
 
     @app.get('/api/describe')
@@ -254,7 +279,7 @@ def create_app(*,
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
         overrides = parse_overrides(var)
-        v = make_fork(base, overrides)
+        v = make_override_variant(base, overrides)
         return {'module': module, 'variant': v.name,
                 'fingerprint': v.fingerprint,
                 'config': v.config.merged()}
@@ -390,6 +415,139 @@ def create_app(*,
             raise HTTPException(status_code=404)
         return FileResponse(candidate)
 
+    # --- script forks ----------------------------------------------------
+    # A "script fork" is a real on-disk copy of a pipeline .py with a
+    # recorded parent. Distinct from an "override variant" (config tweak,
+    # in-memory only). The fork is editable and discoverable like any
+    # other pipeline module.
+
+    def _module_file(module: str) -> str:
+        d = discovery.DISCOVERED_PATHS.get(module)
+        if not d:
+            raise HTTPException(status_code=404,
+                                detail=f'unknown module {module!r}; rescan?')
+        path = os.path.join(d, f'{module}.py')
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail=f'no file at {path}')
+        return path
+
+    _NAME_RE = __import__('re').compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+    @app.get('/api/script')
+    def _get_script(module: str):
+        path = _module_file(module)
+        sidecar = path[:-3] + '.fork.json'
+        info = None
+        if os.path.isfile(sidecar):
+            try:
+                info = json.loads(Path(sidecar).read_text())
+            except Exception:
+                info = {'error': 'sidecar unreadable'}
+        return {'module': module, 'path': path,
+                'source': Path(path).read_text(),
+                'fork': info}
+
+    @app.put('/api/script')
+    async def _put_script(req: Request):
+        data = await req.json()
+        module = data.get('module')
+        source = data.get('source')
+        if not module or source is None:
+            raise HTTPException(status_code=400,
+                                detail='module and source required')
+        path = _module_file(module)
+        Path(path).write_text(source)
+        #Snapshot the edit into _scripts/.git/ for traceability.
+        try:
+            from .git_backup import snapshot
+            snapshot(app.state.registry.root, path,
+                     f'edit {module} via UI')
+        except Exception:
+            pass
+        return {'module': module, 'path': path, 'bytes': len(source)}
+
+    @app.post('/api/fork_script')
+    async def _fork_script(req: Request):
+        import re as _re
+        data = await req.json()
+        parent_module = data.get('parent_module')
+        new_name = (data.get('new_name') or '').strip()
+        if not parent_module or not new_name:
+            raise HTTPException(status_code=400,
+                                detail='parent_module and new_name required')
+        if not _NAME_RE.match(new_name):
+            raise HTTPException(status_code=400,
+                                detail='new_name must be a valid Python identifier')
+        parent_path = _module_file(parent_module)
+        parent_dir = os.path.dirname(parent_path)
+        new_path = os.path.join(parent_dir, f'{new_name}.py')
+        if os.path.exists(new_path):
+            raise HTTPException(status_code=409,
+                                detail=f'{new_path} already exists')
+
+        src = Path(parent_path).read_text()
+
+        #Rewrite the first `Pipeline('<parent_module>', ...)` literal so
+        #runs land under a distinct top-level dir. Parents that build the
+        #name dynamically are left alone; the user can edit by hand.
+        new_src, n_pipe = _re.subn(
+            r"""(Pipeline\s*\(\s*)(['"])""" + _re.escape(parent_module) + r"""\2""",
+            lambda m: f"{m.group(1)}{m.group(2)}{new_name}{m.group(2)}",
+            src, count=1)
+
+        #Rewrite variant names so the fork's dm.register() calls don't
+        #collide with the parent's when both modules are loaded in the
+        #same server process. We prefix every variant name in this file:
+        #`register('X', ...)` and `base='X'` both get the new prefix.
+        #Discover existing names by parsing the parent module's
+        #attributed variants.
+        discovery.load_module(parent_module)
+        existing = set(_global_registry.for_module(parent_module))
+        prefix = f'{new_name}__'
+
+        def _rename(m, existing=existing, prefix=prefix):
+            head, q, nm = m.group(1), m.group(2), m.group(3)
+            if nm in existing:
+                return f'{head}{q}{prefix}{nm}{q}'
+            return m.group(0)
+
+        # register('name', ...) / dm.register('name', ...)
+        new_src, n_reg = _re.subn(
+            r"""(\bregister\s*\(\s*)(['"])([A-Za-z_][A-Za-z0-9_]*)\2""",
+            _rename, new_src)
+        # base='name'
+        new_src, n_base = _re.subn(
+            r"""(\bbase\s*=\s*)(['"])([A-Za-z_][A-Za-z0-9_]*)\2""",
+            _rename, new_src)
+
+        Path(new_path).write_text(new_src)
+
+        sidecar = {
+            'parent_module': parent_module,
+            'parent_path': parent_path,
+            'created': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'pipeline_name_rewritten': bool(n_pipe),
+            'variant_prefix': prefix,
+            'variants_renamed': n_reg,
+            'base_refs_renamed': n_base,
+        }
+        sidecar_path = new_path[:-3] + '.fork.json'
+        Path(sidecar_path).write_text(json.dumps(sidecar, indent=2))
+
+        try:
+            from .git_backup import snapshot
+            snapshot(app.state.registry.root, new_path,
+                     f'fork {parent_module} -> {new_name}')
+            snapshot(app.state.registry.root, sidecar_path,
+                     f'fork sidecar for {new_name}')
+        except Exception:
+            pass
+
+        #Re-scan so the fork shows up in /api/modules.
+        discovery.discover(app.state.scan_root)
+        return {'module': new_name, 'path': new_path,
+                'sidecar': sidecar_path, 'sidecar_data': sidecar}
+
     # --- launch ----------------------------------------------------------
     @app.post('/api/launch')
     async def _launch(req: Request):
@@ -402,7 +560,7 @@ def create_app(*,
         discovery.load_module(module)
         base = _global_registry.get(variant)
         overrides = parse_overrides(data.get('vars') or [])
-        fork = make_fork(base, overrides)
+        ov = make_override_variant(base, overrides)
         cmd = [sys.executable, '-m', 'diffman', 'run', module, variant,
                '--runs-root', app.state.registry.root]
         for k, v in flatten_overrides(overrides):
@@ -413,16 +571,27 @@ def create_app(*,
             cmd += ['--force', data['force']]
 
         log_dir = os.path.join(app.state.registry.root, '_jobs',
-                               f'{fork.name}_{fork.short_fingerprint()}')
+                               f'{ov.name}_{ov.short_fingerprint()}')
         env = os.environ.copy()
         extra = discovery.DISCOVERED_PATHS.get(module)
         if extra:
             pp = env.get('PYTHONPATH', '')
             env['PYTHONPATH'] = extra + (os.pathsep + pp if pp else '')
+        #Per-launch sbatch overrides. Accepts a shell-style string
+        #('--partition=regular --time=01:00:00') or a list of flags.
+        #Silently ignored by LocalSubmitter.
+        raw_flags = data.get('sbatch_flags')
+        if isinstance(raw_flags, str):
+            extra_flags = shlex.split(raw_flags)
+        elif isinstance(raw_flags, list):
+            extra_flags = list(raw_flags)
+        else:
+            extra_flags = None
         info = app.state.submitter.submit(cmd, cwd=os.getcwd(),
-                                          env=env, log_dir=log_dir)
-        info.update({'cmd': cmd, 'fork_name': fork.name,
-                     'fork_short_fp': fork.short_fingerprint()})
+                                          env=env, log_dir=log_dir,
+                                          extra_flags=extra_flags)
+        info.update({'cmd': cmd, 'variant_name': ov.name,
+                     'variant_short_fp': ov.short_fingerprint()})
         app.state.bcast.schedule({'type': 'launch', **info})
         return info
 

@@ -42,7 +42,7 @@ diffman = ["ui/*.html", "ui/*.js", "ui/*.css"]
 # or drop into the env with `pixi shell` and use the `diffman` CLI directly.
 # ---------------------------------------------------------------------------
 
-[tool.pixi.project]
+[tool.pixi.workspace]
 name = "diffman"
 description = "Variant/cache/run manager + live-preview UI for simulation pipelines"
 channels = ["conda-forge"]

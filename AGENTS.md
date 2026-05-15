@@ -34,9 +34,22 @@ fix usually means touching both.
 
 - **Variant** = named `Config` (nested dict, deep-merge) with optional
   inheritance. Pipeline modules call `dm.register('name', base='parent',
-  **overrides)` to build trees. Inline overrides via CLI/UI `--var k=v`
-  create a synthetic *fork* variant named `<base>+<short-fp>` — each
-  unique override set lives in its own run directory.
+  **overrides)` to build trees. The registry is global, but each Variant
+  records the `__name__` of the calling module (via stack inspection in
+  `register()`); `registry.for_module(mod)` filters by that, and the UI
+  uses it so one pipeline's variants don't bleed into another's listing.
+- **Override variant** = inline `--var k=v` overrides synthesized at
+  submit time into a Variant named `<base>+<short-fp>`. Inherits the
+  base's `module` attribution. Each unique override set lives in its
+  own run directory. Not a script fork.
+- **Script fork** = an on-disk copy of a pipeline `.py`. Created via
+  `POST /api/fork_script {parent_module, new_name}`; the server writes
+  `<new_name>.py` next to the parent, rewrites the `Pipeline('<parent>',
+  ...)` literal to use the new name, prefixes every variant name in the
+  file with `<new_name>__` so the parent and fork can coexist in one
+  process, and drops a `<new_name>.fork.json` sidecar recording the
+  parent. Both files get committed into `_scripts/.git/`. The fork
+  module is then editable via `GET/PUT /api/script`.
 - **Stage** = `(name, fn, inputs, config_keys)`. The stage's cache key is
   a sha256 of `(name, source-of-fn, restricted-config, upstream-keys)`.
   `config_keys=('a','b')` means only those top-level subtrees feed the

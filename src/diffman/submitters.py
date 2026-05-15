@@ -13,7 +13,8 @@ from typing import Optional
 class Submitter:
     kind = 'base'
 
-    def submit(self, cmd: list[str], *, cwd=None, env=None, log_dir=None) -> dict:
+    def submit(self, cmd: list[str], *, cwd=None, env=None, log_dir=None,
+               extra_flags: Optional[list[str]] = None) -> dict:
         raise NotImplementedError
 
 
@@ -21,7 +22,8 @@ class LocalSubmitter(Submitter):
     """Fire-and-forget subprocess launcher."""
     kind = 'local'
 
-    def submit(self, cmd, *, cwd=None, env=None, log_dir=None) -> dict:
+    def submit(self, cmd, *, cwd=None, env=None, log_dir=None,
+               extra_flags=None) -> dict:
         os.makedirs(log_dir or '.', exist_ok=True)
         log_path = os.path.join(log_dir or '.', 'job.log')
         f = open(log_path, 'ab')
@@ -42,14 +44,19 @@ class SlurmSubmitter(Submitter):
     def __init__(self, sbatch_flags: Optional[list[str]] = None):
         self.sbatch_flags = list(sbatch_flags or ())
 
-    def submit(self, cmd, *, cwd=None, env=None, log_dir=None) -> dict:
+    def submit(self, cmd, *, cwd=None, env=None, log_dir=None,
+               extra_flags=None) -> dict:
         os.makedirs(log_dir or '.', exist_ok=True)
         script_path = os.path.join(log_dir or '.', 'sbatch.sh')
         log_path = os.path.join(log_dir or '.', 'slurm-%j.out')
+        #Per-launch `extra_flags` are appended after server-level defaults,
+        #so a duplicate `--partition=foo` on the launch overrides the
+        #server default (sbatch honors the last directive).
+        flags = list(self.sbatch_flags) + list(extra_flags or ())
         with open(script_path, 'w') as f:
             f.write('#!/bin/bash\n')
             f.write(f'#SBATCH --output={log_path}\n')
-            for flag in self.sbatch_flags:
+            for flag in flags:
                 f.write(f'#SBATCH {flag}\n')
             f.write(f'cd {shlex.quote(cwd or os.getcwd())}\n')
             f.write(f'exec {shlex.join(cmd)}\n')

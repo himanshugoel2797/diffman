@@ -181,10 +181,14 @@ def _fn_source_hash(fn: Callable) -> str:
 # ---------------------------------------------------------------------------
 
 class Variant:
-    def __init__(self, name: str, base: Optional['Variant'], overrides: dict):
+    def __init__(self, name: str, base: Optional['Variant'], overrides: dict,
+                 module: Optional[str] = None):
         self.name = name
         self.base = base
         self.overrides = Config(overrides)
+        #Fully-qualified module name that called `register()`. None for
+        #ad-hoc/synthetic variants (e.g. override-variants built at submit time).
+        self.module = module
 
     @property
     def config(self) -> Config:
@@ -208,13 +212,17 @@ class VariantRegistry:
     def __init__(self):
         self._variants: dict[str, Variant] = {}
 
-    def register(self, name: str, *, base: Optional[str] = None, **overrides) -> Variant:
+    def register(self, name: str, *, base: Optional[str] = None,
+                 module: Optional[str] = None, **overrides) -> Variant:
         if name in self._variants:
             raise ValueError(f"variant {name!r} already registered")
         base_v = self._variants[base] if base is not None else None
-        v = Variant(name, base_v, overrides)
+        v = Variant(name, base_v, overrides, module=module)
         self._variants[name] = v
         return v
+
+    def for_module(self, module: str) -> list[str]:
+        return [v.name for v in self._variants.values() if v.module == module]
 
     def get(self, name: str) -> Variant:
         return self._variants[name]
@@ -230,8 +238,14 @@ registry = VariantRegistry()
 
 
 def register(name: str, *, base: Optional[str] = None, **overrides) -> Variant:
-    """Convenience wrapper around the module-default registry."""
-    return registry.register(name, base=base, **overrides)
+    """Convenience wrapper around the module-default registry.
+
+    Records the caller's `__name__` on the Variant so the UI can list
+    variants per-pipeline instead of dumping the global registry.
+    """
+    caller = inspect.currentframe().f_back
+    mod_name = caller.f_globals.get('__name__') if caller else None
+    return registry.register(name, base=base, module=mod_name, **overrides)
 
 
 # ---------------------------------------------------------------------------
