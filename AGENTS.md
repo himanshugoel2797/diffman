@@ -134,6 +134,15 @@ Downstream stages access upstream output via
 Each run records `chain`/`variation`/`upstream` in its `run.json` so
 chain progress is reconstructible from disk.
 
+Chains may declare `parent='other_chain'` to fork; the UI groups child
+chains under their parent and offers a source diff just like pipeline
+forks.
+
+Stages can write scoreboard metrics via
+`ctx.metric('<stage>', '<name>', value)`. These persist to
+`stages/<stage>/metrics.json` and are aggregated across a chain's
+variations by the `/api/scoreboard/{chain}` endpoint.
+
 ### A new artifact renderer
 
 Extend `renderers.render()` in

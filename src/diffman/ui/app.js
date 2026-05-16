@@ -70,6 +70,7 @@ const App = {
     try {
       const p = await jget('/api/pipelines');
       const r = await jget('/api/runs');
+      const ch = await jget('/api/chains').catch(() => ({forest: []}));
       //Build a pipeline.name → module lookup for run→pipeline navigation.
       this._pipelineToModule = {};
       const walk = n => {
@@ -79,6 +80,7 @@ const App = {
       (p.forest || []).forEach(walk);
       this.allRuns = r.runs || [];
       this.renderForest(p.forest || []);
+      this.renderChainForest(ch.forest || []);
       this.renderRuns(this.allRuns);
     } catch (e) {
       console.error(e);
@@ -382,6 +384,306 @@ const App = {
     main.appendChild(el('pre', {text: JSON.stringify(d.config, null, 2)}));
   },
 
+  // -- chain sidebar + page ---------------------------------------------
+
+  renderChainForest(forest) {
+    const cs = $('#chains');
+    cs.innerHTML = '';
+    if (forest.length === 0) {
+      cs.appendChild(el('div', {class: 'hint', text: '(no chains discovered)'}));
+      return;
+    }
+    for (const node of forest) cs.appendChild(this.renderChainNode(node, 0));
+  },
+
+  renderChainNode(node, depth) {
+    const wrap = el('div', {class: 'fork-node', style: `padding-left:${depth*10}px`});
+    const isActive = this.current && this.current.kind === 'chain'
+                     && this.current.name === node.name;
+    const a = el('a', {href: '#', text: node.name,
+      class: isActive ? 'active' : '',
+      title: `module: ${node.module || '?'}` +
+             (node.orphan_parent ? `  (parent ${node.orphan_parent} not found)` : ''),
+      onclick: ev => { ev.preventDefault(); this.showChain(node.name); }});
+    wrap.appendChild(a);
+    wrap.appendChild(el('span', {class: 'fork-meta',
+      text: ` · ${node.step_count} step${node.step_count===1?'':'s'}` +
+            ` · ${node.variation_count} var${node.variation_count===1?'':'s'}`}));
+    if (node.orphan_parent) {
+      wrap.appendChild(el('span', {class: 'fork-orphan',
+        text: ` ⚠ parent ${node.orphan_parent} not found`}));
+    }
+    for (const c of (node.children || []))
+      wrap.appendChild(this.renderChainNode(c, depth + 1));
+    return wrap;
+  },
+
+  async showChain(name, variationName) {
+    this.current = {kind: 'chain', name, variation: variationName || null};
+    const main = $('#main'); main.innerHTML = '';
+    main.appendChild(el('h2', {text: `chain: ${name}`}));
+    let d;
+    try { d = await jget('/api/chain/' + encodeURIComponent(name)); }
+    catch (e) { main.appendChild(el('pre', {text: 'load failed: ' + e})); return; }
+
+    //Action bar: source diff vs parent, scoreboard, variation compare.
+    const actions = el('div', {class: 'row', style: 'margin:6px 0'});
+    if (d.parent) {
+      actions.appendChild(el('button', {class: 'ghost',
+        text: 'Source diff vs parent',
+        onclick: () => this.showChainSourceDiff(name)}));
+    }
+    actions.appendChild(el('button', {class: 'ghost', text: 'Scoreboard',
+      onclick: () => this.showScoreboard(name)}));
+    actions.appendChild(el('button', {class: 'ghost',
+      text: 'Compare variations',
+      onclick: () => this.showChainVariationPicker(name, d.variations)}));
+    main.appendChild(actions);
+
+    if (d.parent) {
+      main.appendChild(el('p', {class: 'hint'}, ['forked from ',
+        el('a', {href: '#', text: d.parent,
+          onclick: ev => { ev.preventDefault(); this.showChain(d.parent); }})]));
+    }
+
+    //Variation selector.
+    main.appendChild(el('h3', {text: `Variations (${d.variations.length})`}));
+    const variation = variationName ||
+      (d.variations[0] && d.variations[0].name) || null;
+    const sel = el('select', {class: 'run-filter',
+      style: 'max-width:280px;margin-bottom:8px'});
+    for (const v of d.variations) {
+      sel.appendChild(el('option', {value: v.name, text: v.name}));
+    }
+    if (variation) sel.value = variation;
+    sel.onchange = () => this.showChain(name, sel.value);
+    main.appendChild(sel);
+
+    //Variation tree — show base= inheritance for this chain's variations.
+    main.appendChild(this.renderVariationTree(d.variations));
+
+    if (!variation) {
+      main.appendChild(el('p', {class: 'hint',
+        text: '(this chain has no variations defined yet)'}));
+      return;
+    }
+
+    //DAG view for the selected variation.
+    let prog;
+    try {
+      prog = await jget(`/api/chain_progress/${encodeURIComponent(name)}/${encodeURIComponent(variation)}`);
+    } catch (e) {
+      main.appendChild(el('pre', {text: 'progress failed: ' + e})); return;
+    }
+    main.appendChild(el('h3', {text: `Pipeline (variation: ${variation})`}));
+    main.appendChild(this.renderChainDAG(prog));
+    this.refresh();
+  },
+
+  renderVariationTree(variations) {
+    //Group variations by their base= so we can show the inheritance forest.
+    const wrap = el('div', {class: 'diff-box', style: 'margin-bottom:10px'});
+    wrap.appendChild(el('h3', {text: 'Variation inheritance', style: 'margin-top:0'}));
+    const byBase = {};
+    for (const v of variations) {
+      const b = v.base || '';
+      (byBase[b] = byBase[b] || []).push(v);
+    }
+    const seen = new Set();
+    const renderNode = (v, depth) => {
+      const node = el('div', {style: `padding-left:${depth*16}px; font-family:ui-monospace,monospace; font-size:12px`});
+      const mapping = v.mapping || {};
+      const summary = Object.entries(mapping)
+        .map(([k, val]) => `${k}=${val}`).join('  ');
+      node.appendChild(el('span', {text: v.name}));
+      if (v.base) {
+        node.appendChild(el('span', {class: 'hint', text: ` ← ${v.base}`}));
+      }
+      node.appendChild(el('span', {class: 'hint',
+        style: 'margin-left:8px', text: summary}));
+      if (v.error) {
+        node.appendChild(el('span', {class: 'fork-orphan',
+          text: ' ⚠ ' + v.error}));
+      }
+      seen.add(v.name);
+      wrap.appendChild(node);
+      for (const child of (byBase[v.name] || [])) renderNode(child, depth + 1);
+    };
+    for (const root of (byBase[''] || [])) renderNode(root, 0);
+    //Orphans (base= refers to something we don't know about).
+    for (const v of variations) {
+      if (seen.has(v.name)) continue;
+      renderNode(v, 0);
+    }
+    return wrap;
+  },
+
+  renderChainDAG(prog) {
+    //Render steps as a left-to-right row with arrow connectors. Each
+    //step is a status badge + name; click drills into the underlying
+    //run (when one exists). Failed steps show the error inline below.
+    const wrap = el('div', {class: 'chain-dag'});
+    const row = el('div', {class: 'chain-dag-row'});
+    const stepByName = {};
+    prog.steps.forEach(s => stepByName[s.name] = s);
+    prog.steps.forEach((s, i) => {
+      if (i > 0) {
+        const arrow = el('div', {class: 'chain-dag-arrow', text: '→'});
+        row.appendChild(arrow);
+      }
+      const node = el('div', {class: 'chain-step ' + (s.status || 'pending')});
+      const head = el('div', {class: 'chain-step-head'}, [
+        el('span', {class: 'badge ' + (s.status || 'pending'),
+                    text: s.status || 'pending'}),
+        el('span', {class: 'chain-step-name', text: s.name}),
+      ]);
+      node.appendChild(head);
+      node.appendChild(el('div', {class: 'chain-step-pipe',
+        text: `${s.pipeline} / ${s.variant || '?'}`}));
+      if (s.consumes && s.consumes.length) {
+        node.appendChild(el('div', {class: 'chain-step-meta',
+          text: 'consumes: ' + s.consumes.join(', ')}));
+      }
+      if (s.short_fp) {
+        node.appendChild(el('div', {class: 'chain-step-meta'}, [
+          el('a', {href: '#', text: `run [${s.short_fp}]`,
+            onclick: ev => { ev.preventDefault();
+              this.showRun(s.pipeline, s.variant, s.short_fp); }})
+        ]));
+      }
+      row.appendChild(node);
+    });
+    wrap.appendChild(row);
+    //Inline error panels for failed steps.
+    for (const s of prog.steps) {
+      if (s.status !== 'failed') continue;
+      const errBox = el('div', {class: 'chain-step-error'});
+      errBox.appendChild(el('h4', {text: `error in ${s.name}`}));
+      for (const [stage, tb] of Object.entries(s.errors || {})) {
+        errBox.appendChild(el('p', {class: 'hint', text: `stage: ${stage}`}));
+        errBox.appendChild(el('pre', {text: tb}));
+      }
+      wrap.appendChild(errBox);
+    }
+    return wrap;
+  },
+
+  async showChainSourceDiff(name) {
+    const main = $('#main'); main.innerHTML = '';
+    main.appendChild(el('h2', {text: `Chain source diff — ${name} vs parent`}));
+    let d;
+    try { d = await jget('/api/chain_source_diff?chain=' + encodeURIComponent(name)); }
+    catch (e) { main.appendChild(el('pre', {text: 'failed: ' + e})); return; }
+    if (!d.parent) {
+      main.appendChild(el('p', {class: 'hint', text: 'no parent chain'}));
+      return;
+    }
+    main.appendChild(el('p', {class: 'hint',
+      text: `${d.parent_path} → ${d.child_path}`}));
+    if (!d.diff.trim()) {
+      main.appendChild(el('p', {class: 'hint', text: '(files are identical)'}));
+      return;
+    }
+    main.appendChild(renderUnifiedDiff(d.diff));
+  },
+
+  showChainVariationPicker(chainName, variations) {
+    const main = $('#main'); main.innerHTML = '';
+    main.appendChild(el('h2', {text: `Compare variations — ${chainName}`}));
+    main.appendChild(el('p', {class: 'hint',
+      text: 'Pick ≥2 variations to compare per-step parameter differences.'}));
+    const checks = {};
+    const wrap = el('div', {class: 'variant-list'});
+    for (const v of variations) {
+      const cb = el('input', {type: 'checkbox', id: 'cv-' + v.name});
+      checks[v.name] = cb;
+      wrap.appendChild(el('label', {class: 'cfg-key'}, [cb, ' ' + v.name]));
+    }
+    main.appendChild(wrap);
+    main.appendChild(el('div', {class: 'row', style: 'margin-top:8px'}, [
+      el('button', {class: 'main', text: 'Compare',
+        onclick: () => {
+          const picked = Object.keys(checks).filter(n => checks[n].checked);
+          if (picked.length < 2) { alert('pick at least 2'); return; }
+          this.showChainVariationDiff(chainName, picked);
+        }}),
+      el('button', {class: 'ghost', text: 'Back to chain',
+        onclick: () => this.showChain(chainName)}),
+    ]));
+  },
+
+  async showChainVariationDiff(chainName, variations) {
+    const main = $('#main'); main.innerHTML = '';
+    main.appendChild(el('h2',
+      {text: `Compare variations — ${chainName}: ${variations.join(' / ')}`}));
+    let d;
+    try {
+      d = await jget('/api/chain_variation_diff?' + new URLSearchParams({
+        chain: chainName, variations: variations.join(',')}));
+    } catch (e) {
+      main.appendChild(el('pre', {text: 'failed: ' + e})); return;
+    }
+    for (const step of d.steps) {
+      main.appendChild(el('h3', {text: `step: ${step.step}  (pipeline ${step.pipeline})`}));
+      const tbl = el('table', {class: 'compare-table'});
+      const header = el('tr', {}, [el('th', {text: 'key'})]);
+      for (const c of step.columns) {
+        header.appendChild(el('th', {
+          text: `${c.variation} (${c.variant})`,
+          class: c.present ? '' : 'missing',
+          title: c.present ? c.fingerprint.slice(0,12) : (c.error || 'missing')}));
+      }
+      tbl.appendChild(header);
+      if (!step.rows.length) {
+        const tr = el('tr', {}, [el('td', {colspan: step.columns.length + 1,
+                                           class: 'hint',
+                                           text: '(no parameters)'})]);
+        tbl.appendChild(tr);
+      }
+      for (const row of step.rows) {
+        const tr = el('tr', {class: row.equal ? '' : 'compare-differs'}, [
+          el('td', {class: 'diff-key', text: row.path}),
+        ]);
+        for (const v of row.values) {
+          tr.appendChild(el('td', {text: v === null ? '—' : fmtVal(v)}));
+        }
+        tbl.appendChild(tr);
+      }
+      main.appendChild(tbl);
+    }
+    main.appendChild(el('button', {class: 'ghost', style: 'margin-top:12px',
+      text: 'Back to chain',
+      onclick: () => this.showChain(chainName)}));
+  },
+
+  async showScoreboard(chainName) {
+    const main = $('#main'); main.innerHTML = '';
+    main.appendChild(el('h2', {text: `Scoreboard — ${chainName}`}));
+    let d;
+    try { d = await jget('/api/scoreboard/' + encodeURIComponent(chainName)); }
+    catch (e) { main.appendChild(el('pre', {text: 'failed: ' + e})); return; }
+    if (!d.metric_keys.length) {
+      main.appendChild(el('p', {class: 'hint',
+        text: '(no metrics recorded yet — stages call ctx.metric(stage, name, value) to populate this)'}));
+    }
+    const tbl = el('table', {class: 'compare-table'});
+    const header = el('tr', {}, [el('th', {text: 'variation'})]);
+    for (const k of d.metric_keys) header.appendChild(el('th', {text: k}));
+    tbl.appendChild(header);
+    for (const row of d.rows) {
+      const tr = el('tr', {}, [el('td', {class: 'diff-key', text: row.variation})]);
+      for (const k of d.metric_keys) {
+        const v = row.metrics[k];
+        tr.appendChild(el('td', {text: v === undefined ? '—' : fmtVal(v)}));
+      }
+      tbl.appendChild(tr);
+    }
+    main.appendChild(tbl);
+    main.appendChild(el('button', {class: 'ghost', style: 'margin-top:12px',
+      text: 'Back to chain',
+      onclick: () => this.showChain(chainName)}));
+  },
+
   async find() {
     const q = $('#find-q').value.trim();
     if (q.length < 4) { alert('need at least 4 chars'); return; }
@@ -495,9 +797,20 @@ const App = {
   async diffArtifactPrompt(artifact) {
     //Inline picker. We only let the user pick runs that aren't the
     //current one. Pipeline → variant → run cascading dropdowns.
+    //When the current run is part of a chain, a sibling-variation
+    //quick-pick is shown first as a shortcut for the common case.
     const runs = (await jget('/api/runs')).runs;
     if (!runs.length) { alert('no runs to diff against'); return; }
     const cur = this.current;
+    let chainCtx = null;
+    if (cur && (cur.kind === 'run' || cur.kind === 'stage')) {
+      try {
+        const rd = await jget(`/api/run/${encodeURIComponent(cur.pipeline)}/${encodeURIComponent(cur.variant)}/${encodeURIComponent(cur.short_fp)}`);
+        if (rd.run && rd.run.chain && rd.run.variation) {
+          chainCtx = {chain: rd.run.chain, variation: rd.run.variation};
+        }
+      } catch (_) {}
+    }
     const self_id = cur && `${cur.pipeline}/${cur.variant}/${cur.short_fp}`;
     const candidates = runs.filter(r =>
       `${r.pipeline}/${r.variant}/${r.short_fp}` !== self_id);
@@ -563,6 +876,54 @@ const App = {
     const controls = el('div', {class: 'row', style: 'margin:8px 0'},
       [el('label', {text: 'compare against: '}), pSel, vSel, rSel, go]);
     main.appendChild(controls);
+
+    if (chainCtx) {
+      //Sibling-variation shortcut. Walk the chain's variations, look up
+      //each variation's run for the same step (= this run's pipeline),
+      //and offer a one-click diff against the same artifact path.
+      try {
+        const detail = await jget('/api/chain/' + encodeURIComponent(chainCtx.chain));
+        const stepName = (detail.steps.find(s => s.pipeline === cur.pipeline) || {}).name;
+        if (stepName) {
+          const others = detail.variations.filter(v => v.name !== chainCtx.variation);
+          if (others.length) {
+            const box = el('div', {class: 'diff-box',
+                                   style: 'margin-top:10px'});
+            box.appendChild(el('h3', {style: 'margin-top:0',
+              text: `Sibling variations of chain '${chainCtx.chain}'`}));
+            for (const v of others) {
+              const link = el('a', {href: '#', text: `→ diff vs '${v.name}'`,
+                onclick: async ev => {
+                  ev.preventDefault();
+                  try {
+                    const prog = await jget(`/api/chain_progress/${encodeURIComponent(chainCtx.chain)}/${encodeURIComponent(v.name)}`);
+                    const sib = (prog.steps || []).find(s => s.name === stepName);
+                    if (!sib || !sib.short_fp) {
+                      alert(`variation '${v.name}' hasn't produced this step yet`);
+                      return;
+                    }
+                    //Build path_b inside the sibling's run dir.
+                    const sibRun = (await jget('/api/runs')).runs.find(r =>
+                      r.pipeline === sib.pipeline && r.variant === sib.variant &&
+                      r.short_fp === sib.short_fp);
+                    if (!sibRun) { alert('sibling run dir not found'); return; }
+                    const path_b = sibRun.fdir + '/' + artifact.path;
+                    const r = await jget('/api/artifact_diff?' + new URLSearchParams({
+                      path_a: artifact.absolute, path_b}));
+                    const out = el('div');
+                    out.appendChild(el('p', {class: 'hint',
+                      text: `'${chainCtx.variation}' vs '${v.name}'  ·  path_b: ${path_b}`}));
+                    this.renderArtifactDiff(out, r);
+                    box.replaceWith(out);
+                  } catch (e) { alert('diff failed: ' + e); }
+                }});
+              box.appendChild(el('div', {}, [link]));
+            }
+            main.appendChild(box);
+          }
+        }
+      } catch (_) {}
+    }
   },
 
   renderArtifactDiff(main, r) {

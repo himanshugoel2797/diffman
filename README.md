@@ -195,6 +195,19 @@ Each run's `run.json` records `chain`, `variation`, and
 `upstream={step: fingerprint}` — chain progress is reconstructible
 from those edges alone, no separate state file.
 
+Stages opt into the scoreboard view by writing scalars during
+execution:
+
+```python
+def _frc(ctx):
+    score = compute_frc(...)
+    ctx.metric('frc', 'score_at_half_period', score)
+    ctx.metric('frc', 'half_period_nm', hp_nm)
+```
+
+These land in `stages/<stage>/metrics.json` and the scoreboard
+aggregates them across all of a chain's variations into one table.
+
 ## Web UI
 
 `diffman serve --root runs --scan-root .` starts the read-only viewer.
@@ -215,7 +228,18 @@ from those edges alone, no separate state file.
   **Diff vs…** button that opens a `(pipeline → variant → run)` picker
   and renders a numerical or text diff against the chosen run's
   matching artifact (numpy stats + delta heatmap, JSON structural diff,
-  or unified text diff).
+  or unified text diff). For runs that are part of a chain, the picker
+  also offers a sibling-variation quick-pick.
+- **Chains** — a separate sidebar section listing the chain fork
+  forest. The chain page shows the variation tree, a variation selector,
+  and a DAG of steps colored by status (`done` / `cached` / `failed` /
+  `pending`); failed steps surface their traceback inline. Buttons:
+  - **Scoreboard** — a variation × metric table aggregated from every
+    stage's `metrics.json` (populated via `ctx.metric()`).
+  - **Compare variations** — pick N variations and get a per-step
+    parameter diff across their resolved configs.
+  - **Source diff vs parent** — unified text diff of two chain `.py`
+    files (chain forks declared via `Chain(..., parent='other')`).
 - **Find** — a fingerprint-prefix search box (sidebar) that maps from
   a `short_fp` back to its variant and runs.
 
@@ -245,6 +269,12 @@ GET  /api/source_diff?module=<name>             → unified diff vs parent .py
 GET  /api/compare?modules=a,b,c&variant=v       → N-way per-key compare
 GET  /api/find?q=<fp-prefix>                    → variants/runs by fp
 GET  /api/artifact_diff?path_a=&path_b=         → numerical/text/json diff
+GET  /api/chains                                → chain fork forest
+GET  /api/chain/{name}                          → chain metadata + variations
+GET  /api/chain_progress/{name}/{variation}     → per-step status
+GET  /api/chain_source_diff?chain=<name>        → diff vs parent chain .py
+GET  /api/chain_variation_diff?chain=&variations=a,b  → per-step config diff
+GET  /api/scoreboard/{name}                     → variation × metric table
 GET  /api/runs                                  → all run records
 GET  /api/run/{p}/{v}/{fp}                      → single run + stages
 GET  /api/stage/{p}/{v}/{fp}/{stage}            → stage detail + artifacts
@@ -264,9 +294,10 @@ WS   /ws                                        → run_changed / pipelines_chan
         run.log
         stages/<stage>/
             outputs/...     # artifacts (any format)
+            metrics.json    # scalars written via ctx.metric() (optional)
             _meta.json
             _key            # cache key string
-    _scripts/.git/          # auto-snapshotted pipeline .py per run
+    _scripts/.git/          # auto-snapshotted pipeline + chain .py per run
 ```
 
 All app-managed state is JSON or git — text-friendly, mergeable, and

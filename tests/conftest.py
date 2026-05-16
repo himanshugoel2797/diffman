@@ -25,9 +25,10 @@ def scan_root(tmp_path, monkeypatch):
     discovery.DISCOVERED_PATHS.clear()
     discovery.DISCOVERED_LIST.clear()
     discovery.PIPELINE_TO_MODULE.clear()
+    discovery.CHAIN_TO_MODULE.clear()
     discovery.PATH_TO_MODULE.clear()
     for k in list(sys.modules):
-        if k.startswith('_diffman_test_'):
+        if k.startswith('_diffman_'):
             del sys.modules[k]
     monkeypatch.syspath_prepend(str(tmp_path))
     return tmp_path

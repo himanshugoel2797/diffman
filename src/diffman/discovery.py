@@ -17,6 +17,9 @@ DISCOVERED_LIST: list[dict] = []           # ordered for UI listing
 # Keyed on the *pipeline name* (the string in `Pipeline('name', ...)`).
 PIPELINE_TO_MODULE: dict[str, str] = {}
 
+# Same idea for chains: chain name -> declaring module name.
+CHAIN_TO_MODULE: dict[str, str] = {}
+
 # Reverse lookup: module path -> module name. Used by the file-watcher
 # to know which module to evict when a .py changes.
 PATH_TO_MODULE: dict[str, str] = {}
@@ -28,7 +31,8 @@ _SKIP_MODULE_NAMES = {'diffman', 'core', 'cli', 'server',
 
 
 def discover(root: str = '.') -> list[dict]:
-    """Walk `root` for .py files mentioning both `diffman` and `PIPELINE`.
+    """Walk `root` for .py files mentioning `diffman` and either
+    `PIPELINE` or `CHAIN`.
 
     No code is executed. Returns and caches a sorted list of
     `{module, path, dir}` entries; populates `DISCOVERED_PATHS` so
@@ -47,7 +51,9 @@ def discover(root: str = '.') -> list[dict]:
                 text = Path(full).read_text(errors='ignore')
             except OSError:
                 continue
-            if 'diffman' not in text or 'PIPELINE' not in text:
+            if 'diffman' not in text:
+                continue
+            if 'PIPELINE' not in text and 'CHAIN' not in text:
                 continue
             mod = os.path.splitext(fn)[0]
             if mod in _SKIP_MODULE_NAMES:
@@ -103,6 +109,22 @@ def load_module(name: str):
             except Exception:
                 pass
         PIPELINE_TO_MODULE[pipe.name] = name
+    #Chains: a module may define a single `CHAIN` or a list `CHAINS`.
+    chains: list = []
+    single = getattr(mod, 'CHAIN', None)
+    if single is not None:
+        chains.append(single)
+    multi = getattr(mod, 'CHAINS', None)
+    if multi:
+        chains.extend(multi)
+    src = getattr(mod, '__file__', None)
+    for ch in chains:
+        if getattr(ch, '_source_file', None) is None:
+            try:
+                ch._source_file = src
+            except Exception:
+                pass
+        CHAIN_TO_MODULE[ch.name] = name
     return mod
 
 
@@ -110,8 +132,8 @@ def evict_module(name: str) -> None:
     """Drop cached state for `name` so the next `load_module` re-imports it.
 
     Used by the file watcher when a pipeline `.py` is edited. Removes
-    sys.modules entry, the pipeline-name reverse mapping, and any
-    variants attributed to this module in the global registry.
+    sys.modules entry, the pipeline- and chain-name reverse mappings,
+    and any variants attributed to this module in the global registry.
     """
     import sys
     from .core import registry as _reg
@@ -119,4 +141,7 @@ def evict_module(name: str) -> None:
     for pn, mn in list(PIPELINE_TO_MODULE.items()):
         if mn == name:
             del PIPELINE_TO_MODULE[pn]
+    for cn, mn in list(CHAIN_TO_MODULE.items()):
+        if mn == name:
+            del CHAIN_TO_MODULE[cn]
     _reg.drop_module(name)

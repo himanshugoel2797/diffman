@@ -432,11 +432,18 @@ class Chain:
     cache plus upstream-aware run fingerprints make re-invocation
     idempotent — re-running a variation after editing only the analysis
     code re-executes only those stages whose function source changed.
+
+    ``parent`` declares this chain as a fork of another chain by name —
+    the UI groups child chains under their parent and offers a source
+    diff of the two chain ``.py`` files, mirroring the pipeline fork
+    forest.
     """
 
-    def __init__(self, name: str, steps: list[ChainStep]):
+    def __init__(self, name: str, steps: list[ChainStep], *,
+                 parent: Optional[str] = None):
         self.name = name
         self.steps = list(steps)
+        self.parent = parent
         self.variations: dict[str, Variation] = {}
         self._source_file: Optional[str] = None
         self._validate()
@@ -465,6 +472,17 @@ class Chain:
     def _run(self, variation: Variation, rr: 'RunRegistry') -> dict:
         mapping = variation.resolve()
         runs: dict[str, RunRecord] = {}
+        if self._source_file:
+            try:
+                from .git_backup import snapshot
+                snapshot(rr.root, self._source_file,
+                         f'chain {self.name}/{variation.name}')
+            except Exception as e:
+                global _snapshot_warned
+                if not _snapshot_warned:
+                    _snapshot_warned = True
+                    _log.warning('git_backup.snapshot failed (further '
+                                 'failures will be silent): %s', e)
         for step in self.steps:
             if step.name not in mapping:
                 raise KeyError(
@@ -533,6 +551,26 @@ class RunContext:
         """
         rec = self.upstream[step_name]
         return os.path.join(rec.fdir, relpath) if relpath else rec.fdir
+
+    def metric(self, stage_name: str, name: str, value) -> None:
+        """Append a scalar/aggregate metric for a stage.
+
+        Metrics are JSON-encoded values written to
+        ``stages/<stage>/metrics.json`` as a flat dict; repeat calls with
+        the same `name` overwrite. The scoreboard endpoint aggregates
+        these across the runs of a chain so an ablation sweep can be
+        read at a glance (avg_flux, frc_score, etc.).
+        """
+        d = self.stage_dir(stage_name)
+        path = os.path.join(d, 'metrics.json')
+        try:
+            data = json.loads(Path(path).read_text()) if os.path.exists(path) else {}
+        except (json.JSONDecodeError, OSError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data[name] = value
+        Path(path).write_text(json.dumps(data, indent=2, default=str))
 
     def stage_dir(self, stage_name: str) -> str:
         d = os.path.join(self.fdir, 'stages', stage_name)
