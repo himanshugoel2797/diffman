@@ -2,8 +2,9 @@
 
 Each renderer takes a file path and returns a typed payload dict:
 
-    {'kind': 'image'  | 'plot' | 'plot_json' | 'text' | 'json' |
-              'binary' | 'h5_tree' | 'error',
+    {'kind': 'srw' | 'image' | 'text' | 'json' | 'h5_tree' | 'scalar'
+              | 'plot_1d' | 'plot_2d' | 'array_summary' | 'binary'
+              | 'error',
      'data': <renderer-specific>,
      'meta': {...}}
 

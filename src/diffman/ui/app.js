@@ -4,10 +4,12 @@ const $ = (sel) => document.querySelector(sel);
 const el = (tag, props={}, kids=[]) => {
   const e = document.createElement(tag);
   for (const [k,v] of Object.entries(props)) {
-    if (k === 'class') e.className = v;
+    if (v === null || v === undefined) continue;
+    if (k === 'class') { if (v) e.className = v; }
     else if (k === 'onclick') e.onclick = v;
     else if (k === 'html') e.innerHTML = v;
     else if (k === 'text') e.textContent = v;
+    else if (typeof v === 'boolean') { if (v) e.setAttribute(k, ''); }
     else e.setAttribute(k, v);
   }
   for (const k of (Array.isArray(kids) ? kids : [kids])) {
@@ -37,7 +39,11 @@ const App = {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${proto}//${location.host}/ws`);
     this.ws = ws;
-    ws.onopen = () => $('#ws-status').classList.add('connected');
+    ws.onopen = () => {
+      $('#ws-status').classList.add('connected');
+      $('#ws-status').classList.remove('error');
+    };
+    ws.onerror = () => $('#ws-status').classList.add('error');
     ws.onclose = () => {
       $('#ws-status').classList.remove('connected');
       setTimeout(() => this.connectWS(), 2000);
@@ -223,8 +229,14 @@ const App = {
   },
 
   async showSourceDiff(module) {
+    //Keep sidebar highlight on the pipeline we forked from.
+    this.current = {kind: 'pipeline', module};
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `Source diff — ${module} vs parent`}));
+    main.appendChild(el('p', {}, [
+      el('a', {href: '#', text: `← back to ${module}`,
+        onclick: ev => { ev.preventDefault(); this.showPipeline(module); }}),
+    ]));
     let d;
     try { d = await jget('/api/source_diff?module=' + encodeURIComponent(module)); }
     catch (e) { main.appendChild(el('pre', {text: 'failed: ' + e})); return; }
@@ -274,11 +286,24 @@ const App = {
   async showCompare(modules, variant) {
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `Compare: ${variant}`}));
+    //Best-effort back link: drop the user at the first module's pipeline.
+    if (modules.length) {
+      const m0 = modules[0];
+      main.appendChild(el('p', {}, [
+        el('a', {href: '#', text: `← back to ${m0}`,
+          onclick: ev => { ev.preventDefault(); this.showPipeline(m0); }}),
+      ]));
+    }
     let d;
     try {
       d = await jget('/api/compare?' +
         new URLSearchParams({modules: modules.join(','), variant}));
     } catch (e) { main.appendChild(el('pre', {text: 'failed: ' + e})); return; }
+    if (!d.rows.length && d.columns.every(c => !c.present)) {
+      main.appendChild(el('p', {class: 'hint',
+        text: `(no module registered a variant named '${variant}')`}));
+      return;
+    }
     const tbl = el('table', {class: 'compare-table'});
     const header = el('tr', {}, [el('th', {text: 'key'})]);
     for (const c of d.columns) {
@@ -347,6 +372,10 @@ const App = {
     this.current = {kind: 'variant', module, variant};
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `${module} / ${variant}`}));
+    main.appendChild(el('p', {}, [
+      el('a', {href: '#', text: `← back to ${module}`,
+        onclick: ev => { ev.preventDefault(); this.showPipeline(module); }}),
+    ]));
     let d;
     try {
       d = await jget('/api/variant_overrides?' +
@@ -782,9 +811,10 @@ const App = {
         for (const r of v.runs) {
           tbl.appendChild(el('tr', {}, [
             el('td', {text: ''}), el('td', {text: ''}),
-            el('td', {text: r.short_fp,
-              onclick: () => this.showRun(p.pipeline, v.variant, r.short_fp),
-              style: 'cursor:pointer; color:var(--info)'}),
+            el('td', {}, [
+              el('a', {href: '#', text: r.short_fp,
+                onclick: ev => { ev.preventDefault();
+                  this.showRun(p.pipeline, v.variant, r.short_fp); }})]),
             el('td', {text: humanSize(r.size)})]));
         }
       }
@@ -800,6 +830,11 @@ const App = {
     catch (e) { alert('find failed: ' + e); return; }
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `find: ${q}`}));
+    if (!r.variants.length && !r.runs.length) {
+      main.appendChild(el('p', {class: 'hint',
+        text: `(no variants or runs match fingerprint prefix '${q}')`}));
+      return;
+    }
     main.appendChild(el('h3', {text: `Variants (${r.variants.length})`}));
     for (const v of r.variants) {
       main.appendChild(el('div', {}, [
@@ -831,7 +866,8 @@ const App = {
       return;
     }
     const main = $('#main'); main.innerHTML = '';
-    main.appendChild(el('h2', {text: `${pipeline} / ${variant}`, title: short_fp}));
+    main.appendChild(el('h2', {text: `${pipeline} / ${variant} [${short_fp}]`,
+                               title: short_fp}));
     main.appendChild(el('p', {class: 'hint',
       text: `started ${d.run.started || '?'} → ${d.run.ended || '(running)'}`}));
     //Link back to the variant page (overrides view).
@@ -889,6 +925,11 @@ const App = {
     const others = runs.filter(r => r.short_fp !== short_fp);
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `Why did this re-run? — ${pipeline} / ${variant}`}));
+    main.appendChild(el('p', {}, [
+      el('a', {href: '#', text: `← back to run ${short_fp}`,
+        onclick: ev => { ev.preventDefault();
+          this.showRun(pipeline, variant, short_fp); }}),
+    ]));
     main.appendChild(el('p', {class: 'hint',
       text: 'Pick another run of the same pipeline+variant to compare ' +
             'stage cache keys.'}));
@@ -911,6 +952,11 @@ const App = {
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2',
       {text: `Run diff — ${pipeline}/${variant}  ${a} vs ${b}`}));
+    main.appendChild(el('p', {}, [
+      el('a', {href: '#', text: `← back to run ${a}`,
+        onclick: ev => { ev.preventDefault();
+          this.showRun(pipeline, variant, a); }}),
+    ]));
     let d;
     try {
       d = await jget('/api/run_diff?' + new URLSearchParams({
@@ -972,11 +1018,20 @@ const App = {
       return;
     }
     const main = $('#main'); main.innerHTML = '';
-    main.appendChild(el('h2', {text: `${pipeline} / ${variant} / ${stage}`}));
+    main.appendChild(el('h2', {text: `${pipeline} / ${variant} / ${stage}`,
+                               title: short_fp}));
+    main.appendChild(el('p', {}, [
+      el('a', {href: '#', text: `← back to run ${short_fp}`,
+        onclick: ev => { ev.preventDefault();
+          this.showRun(pipeline, variant, short_fp); }}),
+    ]));
     main.appendChild(el('p', {}, [
       'status: ', el('span', {class: 'badge ' + (d.status || 'pending'),
                               text: d.status || 'pending'}),
-      ' ', el('code', {text: (d.key || '').slice(0,12)})
+      ' ',
+      d.key
+        ? el('code', {text: d.key.slice(0,12)})
+        : el('span', {class: 'hint', text: '(no key)'}),
     ]));
     if (d.error) {
       main.appendChild(el('h3', {text: 'Error'}));
@@ -1082,8 +1137,18 @@ const App = {
       }
     };
 
+    const back = el('button', {class: 'ghost', text: 'Cancel',
+      onclick: () => {
+        if (cur && cur.kind === 'stage') {
+          this.showStage(cur.pipeline, cur.variant, cur.short_fp, cur.stage);
+        } else if (cur && cur.kind === 'run') {
+          this.showRun(cur.pipeline, cur.variant, cur.short_fp);
+        } else {
+          this.refresh();
+        }
+      }});
     const controls = el('div', {class: 'row', style: 'margin:8px 0'},
-      [el('label', {text: 'compare against: '}), pSel, vSel, rSel, go]);
+      [el('label', {text: 'compare against: '}), pSel, vSel, rSel, go, back]);
     main.appendChild(controls);
 
     if (chainCtx) {
@@ -1149,20 +1214,36 @@ const App = {
       return;
     }
     if (r.kind === 'json_diff') {
-      if (r.entries && r.entries.length === 0) {
+      //Dict-shaped JSON: server returns `entries` (a configs-diff list).
+      if (r.entries) {
+        if (r.entries.length === 0) {
+          main.appendChild(el('p', {class: 'hint', text: '(identical)'}));
+          return;
+        }
+        const tbl = el('table', {class: 'diff-table'});
+        tbl.appendChild(el('tr', {}, [
+          el('th', {text: 'key'}), el('th', {text: 'a'}), el('th', {text: 'b'})]));
+        for (const e of r.entries) {
+          tbl.appendChild(el('tr', {class: 'diff-' + e.kind}, [
+            el('td', {class: 'diff-key', text: e.path}),
+            el('td', {text: e.kind === 'added' ? '—' : fmtVal(e.parent)}),
+            el('td', {text: e.kind === 'removed' ? '—' : fmtVal(e.child)}),
+          ]));
+        }
+        main.appendChild(tbl);
+        return;
+      }
+      //Non-dict JSON (array, primitive, null): server returns `{a, b, equal}`.
+      if (r.equal) {
         main.appendChild(el('p', {class: 'hint', text: '(identical)'}));
         return;
       }
       const tbl = el('table', {class: 'diff-table'});
-      tbl.appendChild(el('tr', {}, [
-        el('th', {text: 'key'}), el('th', {text: 'a'}), el('th', {text: 'b'})]));
-      for (const e of (r.entries || [])) {
-        tbl.appendChild(el('tr', {class: 'diff-' + e.kind}, [
-          el('td', {class: 'diff-key', text: e.path}),
-          el('td', {text: e.kind === 'added' ? '—' : fmtVal(e.parent)}),
-          el('td', {text: e.kind === 'removed' ? '—' : fmtVal(e.child)}),
-        ]));
-      }
+      tbl.appendChild(el('tr', {}, [el('th', {text: 'a'}), el('th', {text: 'b'})]));
+      tbl.appendChild(el('tr', {class: 'diff-changed'}, [
+        el('td', {text: JSON.stringify(r.a, null, 2)}),
+        el('td', {text: JSON.stringify(r.b, null, 2)}),
+      ]));
       main.appendChild(tbl);
       return;
     }
@@ -1391,8 +1472,12 @@ function humanSize(n) {
   return (n / 1048576).toFixed(1) + ' MB';
 }
 function fmt(x) {
-  return x == null ? '?' :
-    (Math.abs(x) < 1e-3 || Math.abs(x) > 1e6 ? x.toExponential(3) : x.toPrecision(4));
+  if (x == null) return '?';
+  if (x === 0) return '0';
+  if (Number.isNaN(x)) return 'NaN';
+  if (!Number.isFinite(x)) return String(x);
+  return Math.abs(x) < 1e-3 || Math.abs(x) > 1e6
+    ? x.toExponential(3) : x.toPrecision(4);
 }
 function fmtVal(v) {
   if (v === null || v === undefined) return String(v);

@@ -33,7 +33,7 @@ Routes:
   GET  /api/run_diff?pipeline=&variant=&a=&b=     → explain why two runs differ
   GET  /api/disk_usage                            → bytes per pipeline/variant/run
   GET  /artifact/{pipeline}/{variant}/{fp}/{rest} → raw file download
-  WS   /ws                                        → push updates (run_changed)
+  WS   /ws                                        → push updates (run_changed, pipelines_changed)
 """
 
 from __future__ import annotations

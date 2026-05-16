@@ -244,7 +244,15 @@ aggregates them across all of a chain's variations into one table.
   a `short_fp` back to its variant and runs.
 
 The UI auto-refreshes when you edit a pipeline `.py` (filesystem watcher
-on `--scan-root`) or when new runs appear (watcher on `--root`).
+on `--scan-root`) or when new runs appear (watcher on `--root`). A small
+dot next to the **diffman** title in the sidebar reflects the WebSocket
+state — green for connected, red for transport errors, grey while
+reconnecting.
+
+Every drill-in page (variant, stage, source diff, run diff, compare,
+why-re-run picker) carries a back link beneath its heading, since the
+UI has no URL routing and the sidebar only navigates between top-level
+pipelines, chains, and runs.
 
 ## CLI
 
@@ -256,7 +264,7 @@ diffman chains                        # list every discovered chain
 diffman chain <name>                  # one chain's steps + variations (JSON)
 diffman progress <chain> <variation>  # per-step status from disk
 diffman scoreboard <chain> [-b VAR]   # variation × metric table; -b for deltas
-diffman serve [--root DIR] [--port N] [--scan-root DIR] [--bind ADDR]
+diffman serve [--root DIR] [--port N] [--scan-root DIR] [--bind ADDR] [--no-scan]
 ```
 
 `diffman --help` and `diffman <cmd> --help` have the full text.
@@ -286,6 +294,7 @@ GET  /api/runs                                  → all run records
 GET  /api/run/{p}/{v}/{fp}                      → single run + stages
 GET  /api/stage/{p}/{v}/{fp}/{stage}            → stage detail + artifacts
 GET  /api/render?path=                          → renderer payload
+GET  /api/render_dataset?path=&dataset=         → h5 dataset preview
 GET  /api/srw_preview?path=                     → SRW heatmap + h/v cuts (requires srwpy)
 GET  /artifact/{p}/{v}/{fp}/{rest}              → raw artifact download
 WS   /ws                                        → run_changed / pipelines_changed
