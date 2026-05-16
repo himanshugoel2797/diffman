@@ -97,8 +97,11 @@ dm.register('jitter', base='base', probe=dict(jitter=True, amp=0.1))
 
 def _sim(ctx):
     cfg = ctx.variant.config
-    # ... do work; write artifacts under ctx.artifact('sim', 'out.npy')
-    return {'out': ctx.artifact('sim', 'out.npy')}
+    # Run your tool wherever it writes naturally:
+    tmp = '/tmp/out.npy'
+    # ... produce `tmp` ...
+    # Register it under stages/sim/outputs/out.npy (symlink or copy):
+    return {'out': ctx.artifact('sim', 'out.npy', tmp)}
 
 PIPELINE = dm.Pipeline('mysim', [
     dm.Stage('sim', _sim, config_keys=('scan', 'probe')),

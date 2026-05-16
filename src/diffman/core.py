@@ -21,6 +21,7 @@ import inspect
 import json
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import time
@@ -371,8 +372,35 @@ class RunContext:
         os.makedirs(os.path.join(d, 'outputs'), exist_ok=True)
         return d
 
-    def artifact(self, stage_name: str, relpath: str) -> str:
-        return os.path.join(self.stage_dir(stage_name), 'outputs', relpath)
+    def artifact(self, stage_name: str, relpath: str, source: str) -> str:
+        """Register an existing file or directory as an artifact.
+
+        The pipeline writes its output wherever convenient (often a path
+        chosen by an external tool); this method links it into
+        ``stages/<stage>/outputs/<relpath>`` so diffman can serve it.
+        Symlinks when the OS supports them, falls back to copy / copytree
+        otherwise. Returns the destination path.
+        """
+        src = os.path.abspath(source)
+        if not os.path.exists(src):
+            raise FileNotFoundError(
+                f'artifact source does not exist: {source}')
+        dest = os.path.join(self.stage_dir(stage_name), 'outputs', relpath)
+        os.makedirs(os.path.dirname(dest) or '.', exist_ok=True)
+        if os.path.islink(dest) or os.path.isfile(dest):
+            os.unlink(dest)
+        elif os.path.isdir(dest):
+            shutil.rmtree(dest)
+        try:
+            os.symlink(src, dest)
+        except (OSError, NotImplementedError, AttributeError):
+            #Symlinks unsupported (e.g. Windows without privilege) or the
+            #filesystem rejected it; fall back to a real copy.
+            if os.path.isdir(src):
+                shutil.copytree(src, dest)
+            else:
+                shutil.copy2(src, dest)
+        return dest
 
     def log(self, msg: str) -> None:
         with open(os.path.join(self.fdir, 'run.log'), 'a') as f:

@@ -91,9 +91,10 @@ def client(scan_root, make_pipeline):
         dm.register('base', scan=dict(width=5e-6, step=1e-7))
         dm.register('jitter', base='base', probe=dict(amp=0.1))
         def _f(ctx):
-            import numpy as np
-            np.save(ctx.artifact('sim','data.npy'),
-                    np.arange(20).reshape(4,5).astype(float))
+            import numpy as np, tempfile, os
+            tmp = os.path.join(tempfile.mkdtemp(), 'data.npy')
+            np.save(tmp, np.arange(20).reshape(4,5).astype(float))
+            ctx.artifact('sim', 'data.npy', tmp)
             return {}
         PIPELINE = dm.Pipeline('_pipe_a', [dm.Stage('sim', _f)])
     """)
@@ -105,9 +106,10 @@ def client(scan_root, make_pipeline):
         dm.register('typoed', base='base', forks_of='not_a_real_variant',
                     probe=dict(amp=0.9))
         def _f(ctx):
-            import numpy as np
-            np.save(ctx.artifact('sim','data.npy'),
-                    np.arange(20).reshape(4,5).astype(float) * 1.1)
+            import numpy as np, tempfile, os
+            tmp = os.path.join(tempfile.mkdtemp(), 'data.npy')
+            np.save(tmp, np.arange(20).reshape(4,5).astype(float) * 1.1)
+            ctx.artifact('sim', 'data.npy', tmp)
             return {}
         PIPELINE = dm.Pipeline('_pipe_b', [dm.Stage('sim', _f)],
                                parent='_pipe_a')
