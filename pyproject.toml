@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "diffman"
-version = "0.2.1"
+version = "0.3.0"
 description = "Track simulation-pipeline forks and the parameter differences at each fork. Browse runs via a web UI."
 authors = [{name = "Himanshu Goel"}]
 requires-python = ">=3.10"
@@ -44,7 +44,7 @@ diffman = ["ui/*.html", "ui/*.js", "ui/*.css"]
 name = "diffman"
 description = "Variant/cache/run manager + live-preview UI for simulation pipelines"
 channels = ["conda-forge"]
-platforms = ["linux-64", "osx-64", "osx-arm64"]
+platforms = ["linux-64"]
 
 [tool.pixi.dependencies]
 python = "3.11.*"
@@ -57,7 +57,7 @@ h5py = ">=3.8"
 git = "*"
 # SRW Python bindings (provides `srwlib`, `srwlpy`, etc.). Pinned via conda
 # so the native srwlpy ABI matches the env's Python.
-srwpy = ">=4.1"
+srwpy = ">=4.2"
 
 [tool.pixi.pypi-dependencies]
 diffman = { path = ".", editable = true }
