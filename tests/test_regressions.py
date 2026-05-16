@@ -235,11 +235,13 @@ def test_list_runs_skips_malformed_with_warning(scan_root, caplog):
 
 
 # ---------------------------------------------------------------------------
-# core.py: snapshot() failures used to be silent forever. After the fix,
-# the first failure logs a warning.
+# core.py: snapshot() failures used to be silent forever; then logged
+# once per process; now logged on every occurrence so an ongoing
+# failure (corrupted _scripts repo, etc.) doesn't pretend to be working
+# after the first warning.
 # ---------------------------------------------------------------------------
 
-def test_snapshot_failure_is_logged_at_least_once(scan_root, monkeypatch,
+def test_snapshot_failure_is_logged_on_every_call(scan_root, monkeypatch,
                                                    caplog):
     from diffman import core
 
@@ -248,9 +250,6 @@ def test_snapshot_failure_is_logged_at_least_once(scan_root, monkeypatch,
 
     import diffman.git_backup as gb
     monkeypatch.setattr(gb, 'snapshot', boom)
-    #_try_snapshot uses a mutable default for its "already warned" flag;
-    #monkeypatch a fresh list so the warning fires for THIS test.
-    monkeypatch.setattr(core._try_snapshot, '__defaults__', ([False],))
 
     v = core.registry.register('only', module='_diffman_test_snap', x=1)
     pipe = core.Pipeline('_pipe_snap', [core.Stage('sim', lambda ctx: None)])
@@ -258,25 +257,22 @@ def test_snapshot_failure_is_logged_at_least_once(scan_root, monkeypatch,
     reg = core.RunRegistry(root=str(scan_root / 'runs'))
     with caplog.at_level(logging.WARNING, logger='diffman.core'):
         pipe.run(v, reg)
-    assert any('snapshot failed' in rec.message for rec in caplog.records)
+        pipe.run(v, reg)   #second run; warn-once would have skipped this one
+    failures = [r for r in caplog.records if 'snapshot failed' in r.message]
+    assert len(failures) >= 2
 
 
 # ---------------------------------------------------------------------------
-# srw_loaders.py: to_complex's fallback branch was unreachable because the
-# first reshape raised ValueError before `re is None` could be checked.
-# We can't import SRW here, so exercise the canonical and (ne, ny, nx, 2)
-# layouts by reproducing the same shape arithmetic.
+# srw_loaders.py: lock in the canonical (ny, nx, ne, 2) unpacking layout
+# that SRW's srwl_uti_save_wfr_hdf5 writes. An earlier audit tried to
+# detect an alternate (ne, ny, nx, 2) layout via except-ValueError on the
+# reshape, which was structurally unreachable (size-matched reshapes don't
+# raise) AND would silently re-axis-order data if it did. That defensive
+# fallback was removed; this test guards the canonical path against
+# future refactors that might break it.
 # ---------------------------------------------------------------------------
 
 def test_wfr_to_complex_unpacks_canonical_layout(scan_root, monkeypatch):
-    """Guard the canonical (ny, nx, ne, 2) unpacking path of `to_complex`.
-
-    Pre-fix, `to_complex` had a fallback branch for an alternate
-    (ne, ny, nx, 2) layout that was unreachable — the size check meant
-    the canonical reshape always succeeded. The fix restructures the
-    fallback so it can actually fire on alternate layouts. This test
-    locks in the canonical path so a future refactor doesn't break it.
-    """
     from diffman import srw_loaders
 
     ny, nx, ne = 3, 4, 2
@@ -304,7 +300,6 @@ def test_wfr_to_complex_unpacks_canonical_layout(scan_root, monkeypatch):
             return FakeWfr()
 
     monkeypatch.setattr(srw_loaders, '_srwlib', lambda: FakeSrw())
-    monkeypatch.setattr(srw_loaders, '_HAS_NUMPY', True)
     # _load_wfr_hdf5 wants a path it never reads (srwlib is faked).
     out = srw_loaders._load_wfr_hdf5('unused.h5', FakeSrw())
     assert out['kind'] == 'wavefield'
@@ -402,6 +397,34 @@ def test_artifact_route_blocks_dot_dot_traversal_in_url(scan_root):
         r1 = c.get('/artifact/p/v/fp/..%2F..%2Fsecret.txt')
         assert r1.status_code in (400, 404)
         assert 'TOP_SECRET' not in r1.text
+
+
+# ---------------------------------------------------------------------------
+# discovery.py: a partial import that registers a variant and then raises
+# left the variant in the global registry. The retry would then trip the
+# `variant 'X' already registered` guard, masking the real import error.
+# ---------------------------------------------------------------------------
+
+def test_load_module_rolls_back_variants_on_import_failure(scan_root):
+    from diffman import discovery
+    from diffman.core import registry
+
+    path = scan_root / '_diffman_partial.py'
+    path.write_text(
+        "import diffman as dm\n"
+        "dm.register('a', x=1)\n"
+        "raise RuntimeError('boom')\n"
+    )
+    discovery.discover(str(scan_root))
+
+    with pytest.raises(RuntimeError, match='boom'):
+        discovery.load_module('_diffman_partial')
+    # Variant 'a' must NOT remain in the registry — otherwise the retry
+    # below would fail with 'already registered' instead of 'boom'.
+    assert registry.for_module('_diffman_partial') == []
+    # Retry should produce the original error again, not a stale-state one.
+    with pytest.raises(RuntimeError, match='boom'):
+        discovery.load_module('_diffman_partial')
 
 
 def test_api_compare_handles_failed_module(scan_root, make_pipeline):

@@ -43,22 +43,19 @@ def _caller_module() -> Optional[str]:
     return inspect.currentframe().f_back.f_back.f_globals.get('__name__')
 
 
-def _try_snapshot(root: str, source_file: str, message: str,
-                  _warned: list = [False]) -> None:
+def _try_snapshot(root: str, source_file: str, message: str) -> None:
     """Best-effort git snapshot of a pipeline / chain source file.
 
-    Failures (no git, no write perms) are logged once and then silently
-    swallowed — snapshotting is a nice-to-have for traceability, never
-    a blocker for the actual run.
+    Snapshotting is traceability infrastructure, not a run prerequisite,
+    so failures don't propagate. They DO get logged at WARNING on every
+    occurrence — git_backup itself logs the specific git stderr; this
+    layer just ensures a snapshot failure never aborts a run.
     """
     try:
         from .git_backup import snapshot
         snapshot(root, source_file, message)
     except Exception as e:
-        if not _warned[0]:
-            _warned[0] = True
-            _log.warning('git_backup.snapshot failed (further failures '
-                         'will be silent): %s', e)
+        _log.warning('git_backup.snapshot failed: %s', e)
 
 
 # ---------------------------------------------------------------------------
@@ -268,10 +265,6 @@ class Stage:
             'config': dict(cfg),
             'upstream': {k: upstream_keys[k] for k in self.inputs},
         }
-
-    def key(self, variant: Variant, upstream_keys: dict) -> str:
-        return fingerprint({'stage': self.name,
-                            **self.key_components(variant, upstream_keys)})
 
 
 class Pipeline:
@@ -586,7 +579,7 @@ class RunContext:
             shutil.rmtree(dest)
         try:
             os.symlink(src, dest)
-        except (OSError, NotImplementedError, AttributeError):
+        except OSError:
             #Symlinks unsupported (Windows without privilege, exotic FS);
             #fall back to a real copy.
             (shutil.copytree if os.path.isdir(src) else shutil.copy2)(src, dest)
@@ -689,10 +682,20 @@ def _now() -> str:
 
 
 def _git_rev() -> Optional[str]:
+    """Current git HEAD, or None if not in a repo / git not installed.
+
+    Catches only the failure modes we expect from `git rev-parse`:
+      - FileNotFoundError: no `git` on PATH
+      - CalledProcessError: not a repo, or repo has no commits yet
+      - TimeoutExpired: pathological I/O latency
+    Any other exception (e.g. OSError from a broken process state) is
+    a real bug and propagates.
+    """
     try:
         out = subprocess.check_output(
             ['git', 'rev-parse', 'HEAD'],
             stderr=subprocess.DEVNULL, timeout=2)
         return out.decode().strip()
-    except Exception:
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired):
         return None

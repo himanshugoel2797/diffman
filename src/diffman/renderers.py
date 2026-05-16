@@ -23,12 +23,8 @@ import struct
 from pathlib import Path
 from typing import Optional
 
-try:
-    import numpy as np
-    _HAS_NUMPY = True
-except ImportError:
-    np = None
-    _HAS_NUMPY = False
+import numpy as np
+from PIL import Image
 
 try:
     import h5py
@@ -36,13 +32,6 @@ try:
 except ImportError:
     h5py = None
     _HAS_H5PY = False
-
-try:
-    from PIL import Image
-    _HAS_PIL = True
-except ImportError:
-    Image = None
-    _HAS_PIL = False
 
 
 # ---------------------------------------------------------------------------
@@ -91,10 +80,9 @@ def render(path: str, *, max_bytes: int = 4_000_000) -> dict:
 # ---------------------------------------------------------------------------
 
 def _render_image(path, meta):
-    if _HAS_PIL:
-        with Image.open(path) as im:
-            meta['width'], meta['height'] = im.size
-            meta['mode'] = im.mode
+    with Image.open(path) as im:
+        meta['width'], meta['height'] = im.size
+        meta['mode'] = im.mode
     #The server serves the file via the /artifact/ route; the UI loads it
     #with an <img src=...> so we don't have to base64-embed here.
     return {'kind': 'image', 'data': None, 'meta': meta}
@@ -119,9 +107,6 @@ def _render_json(path, meta, max_bytes):
 
 
 def _render_npy(path, meta):
-    if not _HAS_NUMPY:
-        return {'kind': 'binary', 'data': None,
-                'meta': {**meta, 'note': 'numpy not installed'}}
     arr = np.load(path, mmap_mode='r', allow_pickle=False)
     return _array_payload(arr, meta)
 
@@ -164,7 +149,7 @@ def render_h5_dataset(path: str, dataset: str, *,
                     'meta': meta}
         if ds.size > max_points and ds.ndim != 2:
             #Decimate 1D to keep transfer small.
-            stride = int(np.ceil(ds.size / max_points)) if _HAS_NUMPY else 1
+            stride = int(np.ceil(ds.size / max_points))
             data = ds[::stride]
             meta['decimated_stride'] = stride
         else:
@@ -181,8 +166,6 @@ def _array_payload(arr, meta: dict) -> dict:
       - >=3D     -> first slice (arr[0]) + note
       - non-num  -> 'array_summary'
     """
-    if not _HAS_NUMPY:
-        return {'kind': 'binary', 'data': None, 'meta': meta}
     a = np.asarray(arr)
     meta = {**meta, 'shape': list(a.shape), 'dtype': str(a.dtype)}
     if a.ndim == 1:

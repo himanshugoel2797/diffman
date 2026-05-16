@@ -30,12 +30,7 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
-try:
-    import numpy as np
-    _HAS_NUMPY = True
-except ImportError:
-    np = None
-    _HAS_NUMPY = False
+import numpy as np
 
 #SRW import is optional — only required when previewing SRW files.
 _SRWLIB = None
@@ -100,8 +95,6 @@ def load(path: str) -> dict:
 
     The return shape is described in the module docstring.
     """
-    if not _HAS_NUMPY:
-        return {'error': 'numpy not installed'}
     srw = _srwlib()
     if srw is None:
         return {'error': 'srwlib not importable; install SRW to enable SRW previews'}
@@ -146,10 +139,7 @@ def _mesh_dict(mesh) -> dict:
 
 def _load_intens_hdf5(path, srw):
     """Intensity HDF5 produced by srwl_uti_save_intens_hdf5."""
-    try:
-        data, mesh, _, _ = srw.srwl_uti_read_intens_hdf5(_file_path=path)
-    except TypeError:
-        data, mesh, _, _ = srw.srwl_uti_read_intens_hdf5(path)
+    data, mesh, _, _ = srw.srwl_uti_read_intens_hdf5(_file_path=path)
     arr = np.asarray(data, dtype=float)
     if arr.ndim == 1:
         arr = arr.reshape((int(mesh.ny), int(mesh.nx)))
@@ -164,10 +154,7 @@ def _load_intens_hdf5(path, srw):
 
 def _load_intens_ascii(path, srw):
     """Intensity ASCII produced by srwl_uti_save_intens_ascii."""
-    try:
-        data, mesh = srw.srwl_uti_read_intens_ascii(_file_path=path)
-    except TypeError:
-        data, mesh = srw.srwl_uti_read_intens_ascii(path)
+    data, mesh = srw.srwl_uti_read_intens_ascii(_file_path=path)
     arr = np.asarray(data, dtype=float)
     nx = int(mesh.nx); ny = int(mesh.ny)
     if arr.ndim == 1 and nx * ny == arr.size:
@@ -183,32 +170,23 @@ def _load_intens_ascii(path, srw):
 
 def _load_wfr_hdf5(path, srw):
     """Wavefront HDF5 produced by srwl_uti_save_wfr_hdf5."""
-    try:
-        wfr = srw.srwl_uti_read_wfr_hdf5(_file_path=path)
-    except TypeError:
-        wfr = srw.srwl_uti_read_wfr_hdf5(path)
-
+    wfr = srw.srwl_uti_read_wfr_hdf5(_file_path=path)
     mesh = wfr.mesh
     nx = int(mesh.nx); ny = int(mesh.ny); ne = int(getattr(mesh, 'ne', 1))
 
     arEx = np.asarray(wfr.arEx, dtype=np.float32)
     arEy = np.asarray(wfr.arEy, dtype=np.float32)
-    #SRW interleaves real/imag along the fastest-varying axis. The
-    #canonical layout is (ny, nx, ne, 2); some writers produce
-    #(ne, ny, nx, 2). Try canonical first, then fall back.
+    #SRW interleaves real/imag along the fastest-varying axis. The layout
+    #written by srwl_uti_save_wfr_hdf5 is (ny, nx, ne, 2) and that's what
+    #the reader produces — there's no alternate ordering to detect.
     def to_complex(a):
         if a.size != ny * nx * ne * 2:
             raise ValueError(
                 f'wavefield array size {a.size} does not match '
                 f'ny*nx*ne*2 = {ny*nx*ne*2}')
-        try:
-            re = a[0::2].reshape((ny, nx, ne))
-            im = a[1::2].reshape((ny, nx, ne))
-            return (re + 1j * im).transpose(2, 0, 1)  # -> (ne, ny, nx)
-        except ValueError:
-            re = a[0::2].reshape((ne, ny, nx))
-            im = a[1::2].reshape((ne, ny, nx))
-            return re + 1j * im
+        re = a[0::2].reshape((ny, nx, ne))
+        im = a[1::2].reshape((ny, nx, ne))
+        return (re + 1j * im).transpose(2, 0, 1)  # -> (ne, ny, nx)
 
     Ex = to_complex(arEx)
     Ey = to_complex(arEy)
