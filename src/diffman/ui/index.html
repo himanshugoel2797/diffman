@@ -15,10 +15,11 @@
     </div>
     <section>
       <div class="row">
-        <input id="scan-root" type="text" placeholder="scan root (default cwd)">
-        <button onclick="App.scan()">Scan</button>
+        <input id="find-q" type="text" placeholder="fp prefix (≥4 chars)"
+               onkeydown="if(event.key==='Enter') App.find()">
+        <button onclick="App.find()">Find</button>
       </div>
-      <h2>Pipelines</h2>
+      <h2>Pipelines (forks)</h2>
       <div id="modules"></div>
     </section>
     <section>

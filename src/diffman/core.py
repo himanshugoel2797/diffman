@@ -1,8 +1,17 @@
 """Core data structures: Config, Variant, Stage, Pipeline, RunRegistry.
 
-Ported from srwl_uti_diffman.py (in SRW) with class/function names dropped
-to plain (no SRWLDfm prefix), conventions modernized (type hints, Path),
-and the git-script-backup hook moved out into git_backup.py.
+Minimal API used by hand-written pipeline modules:
+
+    import diffman as dm
+    dm.register('base',   scan=dict(width=5e-6))
+    dm.register('jitter', base='base', probe=dict(jitter=True))
+
+    def _sim(ctx): ...
+    PIPELINE = dm.Pipeline('mypipe', [dm.Stage('sim', _sim)],
+                           parent='other_pipeline')
+
+The pipeline is responsible for invoking `PIPELINE.run(variant, registry)`
+itself; diffman does not launch runs.
 """
 
 from __future__ import annotations
@@ -11,58 +20,33 @@ import hashlib
 import inspect
 import json
 import os
-import pickle
 import socket
 import subprocess
 import time
 import traceback
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Optional
-
-try:
-    import numpy as np
-    _HAS_NUMPY = True
-except ImportError:
-    np = None
-    _HAS_NUMPY = False
-
-
-FP_VERSION = 1
-"""Bump to invalidate every existing cache entry (e.g. on SRW upgrade)."""
+from typing import Any, Callable, Iterable, Optional
 
 
 # ---------------------------------------------------------------------------
-# Config tree
+# Config: nested dict with attribute access and deep merge
 # ---------------------------------------------------------------------------
 
 class Config(dict):
-    """Nested dict with attribute access and deep merge.
+    """Nested dict supporting attribute access. `cfg.scan.width` descends.
 
-    Lookups via attribute (`cfg.scan.width`) descend into nested Config
-    instances. Assigning a plain dict auto-promotes to Config.
+    Plain dicts assigned at any level auto-promote to Config so attribute
+    access works at every depth.
     """
 
     def __init__(self, *layers, **kw):
         super().__init__()
         for layer in layers:
             if layer:
-                self._merge(layer)
+                _deep_merge_into(self, layer)
         if kw:
-            self._merge(kw)
-
-    def _merge(self, other):
-        for k, v in other.items():
-            if isinstance(v, dict) and not isinstance(v, Config):
-                v = Config(v)
-            if k in self and isinstance(self[k], Config) and isinstance(v, Config):
-                self[k]._merge(v)
-            elif isinstance(v, Config):
-                fresh = Config()
-                fresh._merge(v)
-                self[k] = fresh
-            else:
-                self[k] = v
+            _deep_merge_into(self, kw)
 
     def __getattr__(self, key):
         try:
@@ -75,97 +59,36 @@ class Config(dict):
             value = Config(value)
         self[key] = value
 
-    def derive(self, **overrides) -> 'Config':
-        out = Config(self)
-        out._merge(overrides)
-        return out
 
-    def merged(self) -> dict:
-        return {
-            k: v.merged() if isinstance(v, Config) else v
-            for k, v in self.items()
-        }
-
-    def subtree(self, keys: Iterable[str]) -> 'Config':
-        return Config({k: self[k] for k in keys if k in self})
-
-    def fingerprint(self, include=None, exclude=None) -> str:
-        return fingerprint(_restrict(self, include, exclude))
-
-
-def _restrict(cfg: Config, include, exclude) -> Config:
-    if include is None and exclude is None:
-        return cfg
-    out = Config()
-    inc = set(include) if include is not None else None
-    exc = set(exclude) if exclude is not None else None
-    for k, v in cfg.items():
-        if inc is not None and k not in inc:
-            continue
-        if exc is not None and k in exc:
-            continue
-        out[k] = v
-    return out
+def _deep_merge_into(dst: dict, src: dict) -> None:
+    for k, v in src.items():
+        if isinstance(v, dict) and not isinstance(v, Config):
+            v = Config(v)
+        if isinstance(dst.get(k), Config) and isinstance(v, Config):
+            _deep_merge_into(dst[k], v)
+        elif isinstance(v, Config):
+            #Always deep-copy a Config into dst so callers can't mutate
+            #the source layer by later modifying the destination.
+            #Config(v) walks v via this same function recursively.
+            dst[k] = Config(v)
+        else:
+            dst[k] = v
 
 
 # ---------------------------------------------------------------------------
-# Fingerprinting
+# Fingerprinting (JSON-canonical sha256)
 # ---------------------------------------------------------------------------
 
 def fingerprint(obj: Any) -> str:
-    """Stable sha256 hex digest for arbitrary Python objects.
+    """Stable sha256 hex digest of a JSON-serializable object.
 
-    Canonical typed encoding for primitives / list / tuple / dict; numpy
-    arrays via (shape, dtype, sha-of-bytes); anything else via pickle.dumps
-    prefixed with FP_VERSION so SRW-version bumps invalidate caches.
+    Configs registered via `dm.register()` are dicts of primitives — we
+    canonicalize via `json.dumps(..., sort_keys=True, default=str)` and
+    hash the bytes. Non-JSON values fall back to `str(value)` so this
+    never raises.
     """
-    h = hashlib.sha256()
-    _digest(obj, h)
-    return h.hexdigest()
-
-
-def _digest(obj, h):
-    if obj is None:
-        h.update(b'N\x00')
-    elif isinstance(obj, bool):
-        h.update(b'B' + (b'1' if obj else b'0'))
-    elif isinstance(obj, int):
-        h.update(b'I' + repr(obj).encode())
-    elif isinstance(obj, float):
-        h.update(b'F' + repr(obj).encode())
-    elif isinstance(obj, str):
-        b = obj.encode('utf-8')
-        h.update(b'S' + len(b).to_bytes(8, 'big') + b)
-    elif isinstance(obj, bytes):
-        h.update(b'b' + len(obj).to_bytes(8, 'big') + obj)
-    elif isinstance(obj, (list, tuple)):
-        h.update(b'L' if isinstance(obj, list) else b'T')
-        h.update(len(obj).to_bytes(8, 'big'))
-        for item in obj:
-            _digest(item, h)
-    elif isinstance(obj, dict):
-        h.update(b'D')
-        items = sorted(obj.items(), key=lambda kv: kv[0])
-        h.update(len(items).to_bytes(8, 'big'))
-        for k, v in items:
-            _digest(k, h)
-            _digest(v, h)
-    elif _HAS_NUMPY and isinstance(obj, np.ndarray):
-        a = np.ascontiguousarray(obj)
-        h.update(b'A')
-        h.update(repr(a.shape).encode())
-        h.update(a.dtype.str.encode())
-        h.update(hashlib.sha256(a.tobytes()).digest())
-    elif _HAS_NUMPY and isinstance(obj, (np.integer, np.floating, np.bool_)):
-        _digest(obj.item(), h)
-    else:
-        try:
-            payload = pickle.dumps(obj, protocol=4)
-        except Exception:
-            payload = repr(obj).encode()
-        h.update(b'P')
-        h.update(FP_VERSION.to_bytes(4, 'big'))
-        h.update(hashlib.sha256(payload).digest())
+    payload = json.dumps(obj, sort_keys=True, default=str).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _fn_source_hash(fn: Callable) -> str:
@@ -173,7 +96,7 @@ def _fn_source_hash(fn: Callable) -> str:
         src = inspect.getsource(fn)
     except (OSError, TypeError):
         src = repr(fn)
-    return hashlib.sha256(src.encode('utf-8')).hexdigest()
+    return hashlib.sha256(src.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -181,71 +104,121 @@ def _fn_source_hash(fn: Callable) -> str:
 # ---------------------------------------------------------------------------
 
 class Variant:
+    """A named config layer with optional inheritance from another Variant.
+
+    `config` walks the base chain and deep-merges. `module` is the
+    `__name__` of the file that registered this variant; used to scope
+    same-named variants across different pipeline modules.
+    """
+
+    __slots__ = ('name', 'base', 'overrides', 'module', 'forks_of')
+
     def __init__(self, name: str, base: Optional['Variant'], overrides: dict,
-                 module: Optional[str] = None):
+                 module: Optional[str] = None,
+                 forks_of: Optional[str] = None):
         self.name = name
         self.base = base
         self.overrides = Config(overrides)
-        #Fully-qualified module name that called `register()`. None for
-        #ad-hoc/synthetic variants (e.g. override-variants built at submit time).
         self.module = module
+        #Cross-pipeline lineage: name of the corresponding variant in the
+        #parent pipeline. Used by /api/diff to match variants across forks
+        #when names changed. None means "match by name".
+        self.forks_of = forks_of
 
     @property
     def config(self) -> Config:
         if self.base is None:
             return Config(self.overrides)
-        return self.base.config.derive(**self.overrides)
+        merged = Config(self.base.config)
+        _deep_merge_into(merged, self.overrides)
+        return merged
 
     @property
     def fingerprint(self) -> str:
-        return self.config.fingerprint()
+        return fingerprint(_to_plain(self.config))
 
-    def short_fingerprint(self, n: int = 12) -> str:
-        return self.fingerprint[:n]
+    @property
+    def short_fp(self) -> str:
+        return self.fingerprint[:12]
 
     def __repr__(self):
         b = self.base.name if self.base else None
-        return f"Variant({self.name!r}, base={b!r})"
+        return f'Variant({self.name!r}, base={b!r}, module={self.module!r})'
+
+
+def _to_plain(d) -> dict:
+    """Strip Config wrappers so json.dumps sees vanilla dicts everywhere."""
+    if isinstance(d, dict):
+        return {k: _to_plain(v) for k, v in d.items()}
+    return d
 
 
 class VariantRegistry:
+    """Maps `(module, variant_name)` -> Variant.
+
+    Keying on the pair lets two pipeline modules each register a variant
+    called e.g. `base` without collision. `module` is captured from the
+    caller's `__name__` by the top-level `register()`.
+    """
+
     def __init__(self):
-        self._variants: dict[str, Variant] = {}
+        self._variants: dict[tuple[Optional[str], str], Variant] = {}
 
     def register(self, name: str, *, base: Optional[str] = None,
-                 module: Optional[str] = None, **overrides) -> Variant:
-        if name in self._variants:
-            raise ValueError(f"variant {name!r} already registered")
-        base_v = self._variants[base] if base is not None else None
-        v = Variant(name, base_v, overrides, module=module)
-        self._variants[name] = v
+                 module: Optional[str] = None,
+                 forks_of: Optional[str] = None,
+                 **overrides) -> Variant:
+        key = (module, name)
+        if key in self._variants:
+            raise ValueError(
+                f'variant {name!r} already registered in {module!r}')
+        base_v = None
+        if base is not None:
+            base_v = self._variants.get((module, base))
+            if base_v is None:
+                #Allow forks to declare base=parent's variant; only one
+                #cross-module match is permitted (ambiguity is an error).
+                matches = [v for (m, n), v in self._variants.items() if n == base]
+                if len(matches) != 1:
+                    raise KeyError(
+                        f'base variant {base!r} not found' if not matches
+                        else f'base {base!r} is ambiguous across modules')
+                base_v = matches[0]
+        v = Variant(name, base_v, overrides, module=module, forks_of=forks_of)
+        self._variants[key] = v
         return v
 
+    def get(self, module: str, name: str) -> Variant:
+        return self._variants[(module, name)]
+
     def for_module(self, module: str) -> list[str]:
-        return [v.name for v in self._variants.values() if v.module == module]
+        return [n for (m, n) in self._variants if m == module]
 
-    def get(self, name: str) -> Variant:
-        return self._variants[name]
+    def drop_module(self, module: str) -> None:
+        """Forget every variant registered by `module`. Used when a
+        pipeline file is re-imported after an edit."""
+        for k in [k for k in self._variants if k[0] == module]:
+            del self._variants[k]
 
-    def __iter__(self) -> Iterator[Variant]:
+    def __iter__(self):
         return iter(self._variants.values())
-
-    def names(self) -> list[str]:
-        return list(self._variants.keys())
 
 
 registry = VariantRegistry()
 
 
-def register(name: str, *, base: Optional[str] = None, **overrides) -> Variant:
-    """Convenience wrapper around the module-default registry.
+def register(name: str, *, base: Optional[str] = None,
+             forks_of: Optional[str] = None, **overrides) -> Variant:
+    """Register a variant, attributing it to the calling module.
 
-    Records the caller's `__name__` on the Variant so the UI can list
-    variants per-pipeline instead of dumping the global registry.
+    `forks_of='other_variant'` declares that this variant is a renamed
+    descendant of `other_variant` in the parent pipeline; the UI uses it
+    to line up cross-fork diffs when variant names changed.
     """
     caller = inspect.currentframe().f_back
     mod_name = caller.f_globals.get('__name__') if caller else None
-    return registry.register(name, base=base, module=mod_name, **overrides)
+    return registry.register(name, base=base, module=mod_name,
+                             forks_of=forks_of, **overrides)
 
 
 # ---------------------------------------------------------------------------
@@ -258,28 +231,28 @@ class Stage:
     fn: Callable
     inputs: tuple = ()
     config_keys: tuple = ()
-    produces: tuple = ()
-    sharded: bool = False
 
     def key(self, variant: Variant, upstream_keys: dict) -> str:
-        cfg = (variant.config.subtree(self.config_keys).merged()
-               if self.config_keys else variant.config.merged())
+        cfg = variant.config
+        if self.config_keys:
+            cfg = {k: cfg[k] for k in self.config_keys if k in cfg}
         return fingerprint({
             'stage': self.name,
             'fn': _fn_source_hash(self.fn),
-            'config': cfg,
+            'config': _to_plain(cfg),
             'upstream': {k: upstream_keys[k] for k in self.inputs},
         })
 
 
 class Pipeline:
-    """An ordered list of Stages with cache-aware dispatch."""
+    """An ordered list of Stages with optional fork-parent attribution."""
 
-    def __init__(self, name: str, stages: list[Stage]):
+    def __init__(self, name: str, stages: list[Stage], *,
+                 parent: Optional[str] = None):
         self.name = name
         self.stages = list(stages)
-        self._by_name = {s.name: s for s in self.stages}
-        self._source_file: Optional[str] = None  #set by discovery.load_module
+        self.parent = parent  # name of the pipeline this was forked from
+        self._source_file: Optional[str] = None  # set by discovery.load_module
         self._validate()
 
     def _validate(self):
@@ -288,7 +261,8 @@ class Pipeline:
             for inp in s.inputs:
                 if inp not in seen:
                     raise ValueError(
-                        f"stage {s.name!r} declares input {inp!r} that hasn't run yet")
+                        f'stage {s.name!r} declares input {inp!r} '
+                        f"that hasn't run yet")
             seen.add(s.name)
 
     def run(self, variant: Variant, registry: 'RunRegistry', *,
@@ -299,12 +273,11 @@ class Pipeline:
         ctx = registry.open_run(self.name, variant)
         upstream_keys: dict[str, str] = {}
 
-        #Snapshot pipeline source into the git backup repo (best-effort).
         if self._source_file:
             try:
                 from .git_backup import snapshot
                 snapshot(registry.root, self._source_file,
-                         f'run {self.name}/{variant.name}/{variant.short_fingerprint()}')
+                         f'run {self.name}/{variant.name}/{variant.short_fp}')
             except Exception:
                 pass
 
@@ -312,9 +285,7 @@ class Pipeline:
             key = stage.key(variant, upstream_keys)
             ctx.record.stage_keys[stage.name] = key
 
-            run_stage = True
-            if only is not None and stage.name not in only:
-                run_stage = False
+            run_stage = only is None or stage.name in only
             if stage.name in force:
                 run_stage = True
 
@@ -337,10 +308,8 @@ class Pipeline:
             try:
                 outputs = stage.fn(ctx) or {}
                 meta = {
-                    'name': stage.name,
-                    'key': key,
-                    'started': t0,
-                    'ended': time.time(),
+                    'name': stage.name, 'key': key,
+                    'started': t0, 'ended': time.time(),
                     'outputs': {k: str(v) for k, v in outputs.items()},
                 }
                 Path(stage_dir).mkdir(parents=True, exist_ok=True)
@@ -377,10 +346,6 @@ class RunRecord:
     errors: dict = field(default_factory=dict)
     git_rev: Optional[str] = None
     host: Optional[str] = None
-    slurm: Optional[dict] = None
-
-    def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2, default=str)
 
 
 class RunContext:
@@ -403,14 +368,21 @@ class RunContext:
 
 
 class RunRegistry:
-    """Owns the on-disk layout: <root>/<pipeline>/<variant>/<fp>/..."""
+    """Owns the on-disk layout: <root>/<pipeline>/<variant>/<fp>/...
+
+    `list_runs()` caches its result; call `invalidate()` (or let the
+    server's watchdog do it) after any filesystem change under `root`.
+    """
 
     def __init__(self, root: str = 'runs'):
         self.root = root
+        self._cache: Optional[list['RunRecord']] = None
+
+    def invalidate(self) -> None:
+        self._cache = None
 
     def open_run(self, pipeline: str, variant: Variant) -> RunContext:
-        fp = variant.short_fingerprint()
-        fdir = os.path.join(self.root, pipeline, variant.name, fp)
+        fdir = os.path.join(self.root, pipeline, variant.name, variant.short_fp)
         os.makedirs(fdir, exist_ok=True)
         record = RunRecord(
             pipeline=pipeline,
@@ -420,34 +392,40 @@ class RunRegistry:
             started=_now(),
             git_rev=_git_rev(),
             host=socket.gethostname(),
-            slurm=_slurm_meta(),
         )
         ctx = RunContext(fdir, variant, record)
         self._flush(record)
         with open(os.path.join(fdir, 'config.json'), 'w') as f:
-            json.dump(variant.config.merged(), f, indent=2, default=str)
+            json.dump(_to_plain(variant.config), f, indent=2, default=str)
+        self._cache = None
         return ctx
 
     def _flush(self, record: RunRecord) -> None:
         with open(os.path.join(record.fdir, 'run.json'), 'w') as f:
-            f.write(record.to_json())
+            json.dump(asdict(record), f, indent=2, default=str)
+        self._cache = None
 
-    def list_runs(self, *, pipeline=None, variant=None) -> list[RunRecord]:
+    def _load_all(self) -> list[RunRecord]:
         out: list[RunRecord] = []
         root = Path(self.root)
         if not root.exists():
             return out
         for run_json in root.glob('*/*/*/run.json'):
-            if pipeline and run_json.parts[-4] != pipeline:
-                continue
-            if variant and run_json.parts[-3] != variant:
-                continue
             try:
-                data = json.loads(run_json.read_text())
+                out.append(RunRecord(**json.loads(run_json.read_text())))
             except Exception:
                 continue
-            out.append(RunRecord(**data))
         return out
+
+    def list_runs(self, *, pipeline=None, variant=None) -> list[RunRecord]:
+        if self._cache is None:
+            self._cache = self._load_all()
+        items = self._cache
+        if pipeline:
+            items = [r for r in items if r.pipeline == pipeline]
+        if variant:
+            items = [r for r in items if r.variant == variant]
+        return items
 
 
 # ---------------------------------------------------------------------------
@@ -462,15 +440,7 @@ def _git_rev() -> Optional[str]:
     try:
         out = subprocess.check_output(
             ['git', 'rev-parse', 'HEAD'],
-            stderr=subprocess.DEVNULL, timeout=2,
-        )
+            stderr=subprocess.DEVNULL, timeout=2)
         return out.decode().strip()
     except Exception:
         return None
-
-
-def _slurm_meta() -> Optional[dict]:
-    keys = ('SLURM_JOB_ID', 'SLURM_PROCID', 'SLURM_NNODES',
-            'SLURM_NTASKS', 'SLURM_JOB_NAME')
-    found = {k: os.environ[k] for k in keys if k in os.environ}
-    return found or None

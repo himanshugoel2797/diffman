@@ -7,28 +7,36 @@ import os
 import sys
 from pathlib import Path
 
-from .core import registry
 
-DISCOVERED_PATHS: dict[str, str] = {}
-DISCOVERED_LIST: list[dict] = []
-_module_variants: dict[str, set[str]] = {}
+DISCOVERED_PATHS: dict[str, str] = {}     # module name -> containing dir
+DISCOVERED_LIST: list[dict] = []           # ordered for UI listing
+
+# Populated lazily by load_module() when a module's PIPELINE name is known.
+# Keyed on the *pipeline name* (the string in `Pipeline('name', ...)`).
+PIPELINE_TO_MODULE: dict[str, str] = {}
+
+# Reverse lookup: module path -> module name. Used by the file-watcher
+# to know which module to evict when a .py changes.
+PATH_TO_MODULE: dict[str, str] = {}
+
+_EXCLUDE = {'__pycache__', '.git', 'runs', 'tests',
+            'node_modules', 'venv', '.venv', 'build', 'dist'}
+_SKIP_MODULE_NAMES = {'diffman', 'core', 'cli', 'server',
+                      'discovery', 'renderers', 'git_backup'}
 
 
-def discover(root: str = '.', exclude=None) -> list[dict]:
-    """Walk `root` looking for diffman pipeline modules.
+def discover(root: str = '.') -> list[dict]:
+    """Walk `root` for .py files mentioning both `diffman` and `PIPELINE`.
 
-    A file qualifies if its source mentions `diffman` (the import) and
-    `PIPELINE` (the assignment). No code is executed.
-
-    Returns a sorted list of {module, path, dir}; side-effects DISCOVERED_PATHS.
+    No code is executed. Returns and caches a sorted list of
+    `{module, path, dir}` entries; populates `DISCOVERED_PATHS` so
+    `load_module()` can find them later.
     """
-    exclude = set(exclude or ('__pycache__', '.git', 'runs', 'tests',
-                              'node_modules', 'venv', '.venv', 'build', 'dist'))
     root_abs = os.path.abspath(root)
     found: list[dict] = []
     for dirpath, dirnames, filenames in os.walk(root_abs):
         dirnames[:] = [d for d in dirnames
-                       if d not in exclude and not d.startswith('.')]
+                       if d not in _EXCLUDE and not d.startswith('.')]
         for fn in filenames:
             if not fn.endswith('.py'):
                 continue
@@ -37,45 +45,58 @@ def discover(root: str = '.', exclude=None) -> list[dict]:
                 text = Path(full).read_text(errors='ignore')
             except OSError:
                 continue
-            if 'diffman' not in text:
+            if 'diffman' not in text or 'PIPELINE' not in text:
                 continue
-            if 'PIPELINE' not in text:
+            mod = os.path.splitext(fn)[0]
+            if mod in _SKIP_MODULE_NAMES:
                 continue
-            mod_name = os.path.splitext(fn)[0]
-            if mod_name in {'diffman', 'core', 'cli', 'server', 'submitters',
-                            'discovery', 'renderers', 'git_backup'}:
-                #Skip our own modules if someone scans the install dir.
-                continue
-            rel_path = os.path.relpath(full, root_abs)
-            rel_dir = os.path.dirname(rel_path) or '.'
-            DISCOVERED_PATHS[mod_name] = os.path.dirname(full)
-            found.append({'module': mod_name, 'path': rel_path, 'dir': rel_dir})
+            DISCOVERED_PATHS[mod] = dirpath
+            PATH_TO_MODULE[full] = mod
+            rel = os.path.relpath(full, root_abs)
+            found.append({'module': mod, 'path': rel,
+                          'dir': os.path.dirname(rel) or '.'})
     found.sort(key=lambda x: (x['dir'], x['module']))
     DISCOVERED_LIST[:] = found
     return found
 
 
 def load_module(name: str):
-    """Import a pipeline module by name; tag its PIPELINE with `_source_file`.
+    """Import a discovered pipeline module by name (idempotent).
 
-    Adds the discovered directory to sys.path if known.
+    Adds its directory to `sys.path` if not already there, then tags the
+    module's `PIPELINE` with its source path so `Pipeline.run()` can
+    git-snapshot it. Tagging happens whether or not the module was
+    already imported, so it works even if the user imported the module
+    directly before calling `load_module`.
     """
-    if name in _module_variants and name in sys.modules:
-        return sys.modules[name]
-    extra = DISCOVERED_PATHS.get(name)
-    if extra and extra not in sys.path:
-        sys.path.insert(0, extra)
-    before = set(registry.names())
-    mod = importlib.import_module(name)
-    _module_variants[name] = set(registry.names()) - before
-    if hasattr(mod, 'PIPELINE'):
-        try:
-            mod.PIPELINE._source_file = getattr(mod, '__file__', None)
-        except Exception:
-            pass
+    if name not in sys.modules:
+        extra = DISCOVERED_PATHS.get(name)
+        if extra and extra not in sys.path:
+            sys.path.insert(0, extra)
+        importlib.import_module(name)
+    mod = sys.modules[name]
+    pipe = getattr(mod, 'PIPELINE', None)
+    if pipe is not None:
+        if getattr(pipe, '_source_file', None) is None:
+            try:
+                pipe._source_file = getattr(mod, '__file__', None)
+            except Exception:
+                pass
+        PIPELINE_TO_MODULE[pipe.name] = name
     return mod
 
 
-def module_variants(name: str) -> list[str]:
-    """Return the variant names registered when `name` was loaded."""
-    return sorted(_module_variants.get(name, set()))
+def evict_module(name: str) -> None:
+    """Drop cached state for `name` so the next `load_module` re-imports it.
+
+    Used by the file watcher when a pipeline `.py` is edited. Removes
+    sys.modules entry, the pipeline-name reverse mapping, and any
+    variants attributed to this module in the global registry.
+    """
+    import sys
+    from .core import registry as _reg
+    sys.modules.pop(name, None)
+    for pn, mn in list(PIPELINE_TO_MODULE.items()):
+        if mn == name:
+            del PIPELINE_TO_MODULE[pn]
+    _reg.drop_module(name)

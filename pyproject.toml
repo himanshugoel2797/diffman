@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "diffman"
-version = "0.1.0"
-description = "Variant/cache/run manager for simulation pipelines, with a live-preview browser UI."
+version = "0.2.0"
+description = "Track simulation-pipeline forks and the parameter differences at each fork. Browse runs via a web UI."
 authors = [{name = "Himanshu Goel"}]
 requires-python = ">=3.10"
 readme = "README.md"

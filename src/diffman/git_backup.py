@@ -43,33 +43,3 @@ def snapshot(runs_root: str, source_file: str, message: str) -> None:
                        stdout=subprocess.DEVNULL)
     except Exception:
         pass
-
-
-def commit_file(runs_root: str, file_path: str, message: str) -> None:
-    """Stage and commit an arbitrary file under <runs_root>/_scripts/.
-
-    Used by the script-fork endpoints. Path must already live inside
-    the _scripts/ tree; this only adds + commits. Silent on failure.
-    """
-    if shutil.which('git') is None:
-        return
-    repo = os.path.join(runs_root, '_scripts')
-    if not os.path.isdir(os.path.join(repo, '.git')):
-        try:
-            subprocess.run(['git', 'init', '-q'], cwd=repo, check=True,
-                           stderr=subprocess.DEVNULL)
-        except subprocess.CalledProcessError:
-            return
-    env = dict(os.environ,
-               GIT_AUTHOR_NAME='diffman', GIT_AUTHOR_EMAIL='diffman@local',
-               GIT_COMMITTER_NAME='diffman', GIT_COMMITTER_EMAIL='diffman@local')
-    try:
-        subprocess.run(['git', 'add', '--', file_path], cwd=repo, check=False,
-                       env=env, stderr=subprocess.DEVNULL)
-        subprocess.run(['git', 'commit', '-qm', message,
-                        '--allow-empty', '--no-gpg-sign'],
-                       cwd=repo, check=False, env=env,
-                       stderr=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL)
-    except Exception:
-        pass

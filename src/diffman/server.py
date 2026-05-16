@@ -1,48 +1,48 @@
 """FastAPI server: REST API + WebSocket push + static UI.
 
+Read-only. diffman tracks the *graph of pipeline forks* and the parameter
+diffs at each fork; it does not launch runs. Runs are created by users
+invoking their pipeline modules directly; diffman discovers the resulting
+run directories and lets you browse them.
+
 Routes:
   GET  /                                          → SPA shell
   GET  /static/...                                → app.js, style.css
-  GET  /api/modules                               → list known modules
-  GET  /api/scan?root=<path>                      → re-discover modules
-  GET  /api/variants?module=<name>                → variant names for a module
-  GET  /api/describe?module=&variant=&var=...     → resolved config (w/ overrides)
-  GET  /api/runs[?pipeline=&variant=]             → all runs
+  GET  /api/pipelines                             → discovered pipelines as a forest
+  GET  /api/variants?module=<name>                → variant names for a pipeline module
+  GET  /api/describe?module=&variant=             → resolved variant config + fingerprint
+  GET  /api/variant_overrides?module=&variant=    → what this variant adds vs its base
+  GET  /api/diff?module=<name>                    → variant diff vs parent pipeline
+  GET  /api/source_diff?module=<name>             → unified text diff of .py vs parent
+  GET  /api/compare?modules=a,b,c&variant=v       → N-way variant comparison
+  GET  /api/find?q=<fp-prefix>                    → variants/runs by fingerprint prefix
+  GET  /api/artifact_diff?path_a=&path_b=         → numerical/text diff of two artifacts
+  GET  /api/runs[?pipeline=&variant=]             → existing run records
   GET  /api/run/{pipeline}/{variant}/{fp}         → single run detail + stages
   GET  /api/stage/{pipeline}/{variant}/{fp}/{st}  → stage detail + artifact list
   GET  /api/render?path=<abs>                     → renderer payload for a file
   GET  /api/render_dataset?path=&dataset=         → h5 dataset preview
+  GET  /api/srw_preview?path=<abs>&...            → SRW-aware heatmap + cuts
   GET  /artifact/{pipeline}/{variant}/{fp}/{rest} → raw file download
-  GET  /api/submitter                             → submitter kind + defaults
-  POST /api/launch                                → submit a run
-  GET  /api/script?module=<name>                  → pipeline .py source + fork sidecar
-  PUT  /api/script   {module, source}             → save edits to a pipeline .py
-  POST /api/fork_script {parent_module, new_name} → copy parent .py to new name
-  WS   /ws                                        → push updates (run_changed, etc.)
+  WS   /ws                                        → push updates (run_changed)
 """
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
-import mimetypes
 import os
-import shlex
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import discovery, renderers
-from .core import (
-    RunRegistry, Variant, fingerprint as _fp, registry as _global_registry,
-)
-from .submitters import Submitter, default_submitter
+from .core import RunRegistry, registry as _global_registry
 
 # Optional: watchdog for filesystem push.
 try:
@@ -54,59 +54,91 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Override parsing (shared with CLI)
+# Config diff
 # ---------------------------------------------------------------------------
 
-_BOOL_TOKENS = {'true': True, 'false': False, 'none': None, 'null': None}
+def diff_configs(parent: dict, child: dict, path: str = '') -> list[dict]:
+    """Deep diff two merged config dicts.
 
-
-def parse_value(s: str):
-    s = s.strip()
-    if s.lower() in _BOOL_TOKENS:
-        return _BOOL_TOKENS[s.lower()]
-    try:
-        return ast.literal_eval(s)
-    except (ValueError, SyntaxError):
-        return s
-
-
-def parse_overrides(entries) -> dict:
-    out = {}
-    for entry in entries or ():
-        if '=' not in entry:
-            raise ValueError(f'expected key=value, got {entry!r}')
-        key, val = entry.split('=', 1)
-        v = parse_value(val)
-        parts = key.strip().split('.')
-        cur = out
-        for p in parts[:-1]:
-            cur = cur.setdefault(p, {})
-        cur[parts[-1]] = v
+    Returns a flat list of `{path, kind, parent, child}` entries where
+    `kind` is one of 'added' (only in child), 'removed' (only in parent),
+    or 'changed' (different values). Nested dicts recurse; leaves compare
+    via `!=`. `path` is dotted, like 'scan.width'.
+    """
+    out: list[dict] = []
+    parent_keys = set(parent.keys()) if isinstance(parent, dict) else set()
+    child_keys = set(child.keys()) if isinstance(child, dict) else set()
+    for k in sorted(parent_keys | child_keys):
+        p_here = path + ('.' if path else '') + k
+        in_p = k in parent_keys
+        in_c = k in child_keys
+        if in_p and not in_c:
+            out.append({'path': p_here, 'kind': 'removed',
+                        'parent': parent[k], 'child': None})
+        elif in_c and not in_p:
+            out.append({'path': p_here, 'kind': 'added',
+                        'parent': None, 'child': child[k]})
+        else:
+            pv, cv = parent[k], child[k]
+            if isinstance(pv, dict) and isinstance(cv, dict):
+                out.extend(diff_configs(pv, cv, p_here))
+            elif pv != cv:
+                out.append({'path': p_here, 'kind': 'changed',
+                            'parent': pv, 'child': cv})
     return out
 
 
-def make_override_variant(base: Variant, overrides: dict) -> Variant:
-    """Build a synthetic Variant carrying inline config overrides.
+# ---------------------------------------------------------------------------
+# Pipeline-forest construction
+# ---------------------------------------------------------------------------
 
-    Not a script fork — purely a config tweak on top of `base`. Name is
-    `<base>+<short-fp-of-overrides>` so a given override set has a stable
-    run directory. Inherits `module` from base for UI attribution.
+def _pipeline_meta(module: str) -> dict:
+    """Import a discovered module and report its pipeline metadata."""
+    try:
+        mod = discovery.load_module(module)
+    except Exception as e:
+        return {'module': module, 'error': f'import failed: {e}'}
+    pipe = getattr(mod, 'PIPELINE', None)
+    if pipe is None:
+        return {'module': module, 'error': 'no PIPELINE attribute'}
+    return {
+        'module': module,
+        'pipeline': pipe.name,
+        'parent': pipe.parent,
+        'variant_count': len(_global_registry.for_module(module)),
+    }
+
+
+def _build_forest(metas: list[dict]) -> list[dict]:
+    """Group pipelines into roots → children by their `parent` declaration.
+
+    Matching is by pipeline name (the string in `Pipeline('name', ...)`).
+    Pipelines whose parent doesn't match anything in the scan are treated
+    as roots and flagged via `orphan_parent`.
     """
-    if not overrides:
-        return base
-    v = Variant(base.name, base, overrides, module=base.module)
-    short = _fp(overrides)[:8]
-    v.name = f'{base.name}+{short}'
-    return v
+    known = {m['pipeline'] for m in metas if 'pipeline' in m}
+    children: dict[Optional[str], list[dict]] = {}
+    for m in metas:
+        if 'pipeline' not in m:
+            children.setdefault(None, []).append(m)
+            continue
+        parent = m.get('parent')
+        if parent and parent not in known:
+            m = {**m, 'orphan_parent': parent}
+            parent = None
+        children.setdefault(parent, []).append(m)
 
+    def _node(m):
+        key = lambda x: x.get('pipeline') or x['module']
+        #Only nodes with a pipeline name can have children. Error metas
+        #live under `children[None]` as roots, so without this guard
+        #_node(error_meta) would recurse into its sibling roots forever.
+        kids = (sorted(children.get(m['pipeline'], []), key=key)
+                if 'pipeline' in m else [])
+        return {**m, 'children': [_node(c) for c in kids]}
 
-def flatten_overrides(d, prefix=''):
-    for k, v in d.items():
-        full = f'{prefix}.{k}' if prefix else k
-        if isinstance(v, dict):
-            yield from flatten_overrides(v, full)
-        else:
-            yield full, v
+    return [_node(r) for r in sorted(children.get(None, []),
+                                     key=lambda x: x.get('pipeline') or x['module'])]
 
 
 # ---------------------------------------------------------------------------
@@ -148,19 +180,20 @@ class _Broadcaster:
 
 if _HAS_WATCHDOG:
     class _RunsWatcher(FileSystemEventHandler):
-        def __init__(self, broadcaster: _Broadcaster, runs_root: str):
+        def __init__(self, broadcaster, run_registry, runs_root: str):
             self.bcast = broadcaster
+            self.run_registry = run_registry
             self.runs_root = os.path.abspath(runs_root)
             self._last = {}
 
-        def _coalesce(self, key: str, payload: dict, *, debounce=0.5):
+        def _coalesce(self, key, payload, *, debounce=0.5):
             now = time.time()
             if key in self._last and now - self._last[key] < debounce:
                 return
             self._last[key] = now
             self.bcast.schedule(payload)
 
-        def _key(self, src_path: str) -> Optional[dict]:
+        def _key(self, src_path):
             try:
                 rel = os.path.relpath(src_path, self.runs_root)
             except ValueError:
@@ -173,6 +206,8 @@ if _HAS_WATCHDOG:
         def on_any_event(self, event):
             if event.is_directory:
                 return
+            #Anything under the runs root invalidates the cached run list.
+            self.run_registry.invalidate()
             k = self._key(event.src_path)
             if k is None:
                 return
@@ -181,26 +216,71 @@ if _HAS_WATCHDOG:
                                   'path': event.src_path,
                                   'event': event.event_type})
 
+    class _ScriptsWatcher(FileSystemEventHandler):
+        """Watch `scan_root` for `.py` edits and refresh the pipeline graph.
+
+        On a hit, evicts the affected module from sys.modules and from the
+        variant registry, re-discovers (so newly-created files are picked
+        up), and pushes a `pipelines_changed` WS event so the UI reloads.
+        """
+
+        def __init__(self, broadcaster, scan_root: str):
+            self.bcast = broadcaster
+            self.scan_root = os.path.abspath(scan_root)
+            self._last = 0.0
+
+        def on_any_event(self, event):
+            if event.is_directory:
+                return
+            #Only react to real content changes. Importing a .py fires
+            #`opened`/`closed_no_write` events too, which would cause us
+            #to evict a module mid-import.
+            if event.event_type not in ('created', 'modified',
+                                         'deleted', 'moved'):
+                return
+            if not event.src_path.endswith('.py'):
+                return
+            #Ignore the byte-compile cache.
+            if '__pycache__' in event.src_path.split(os.sep):
+                return
+            #Coalesce — editors fire many events per save.
+            now = time.time()
+            if now - self._last < 0.5:
+                return
+            self._last = now
+
+            #Evict whichever module owns the changed file.
+            full = os.path.abspath(event.src_path)
+            mod_name = discovery.PATH_TO_MODULE.get(full)
+            if mod_name:
+                discovery.evict_module(mod_name)
+            #Re-discover (a brand-new file would not be in PATH_TO_MODULE).
+            try:
+                discovery.discover(self.scan_root)
+            except Exception:
+                pass
+            self.bcast.schedule({'type': 'pipelines_changed',
+                                 'path': event.src_path,
+                                 'event': event.event_type})
+
 
 # ---------------------------------------------------------------------------
 # FastAPI app factory
 # ---------------------------------------------------------------------------
 
-def create_app(*,
-               root: str = 'runs',
-               scan_root: str = '.',
-               submitter: Optional[Submitter] = None,
+def create_app(*, root: str = 'runs', scan_root: str = '.',
                no_scan: bool = False) -> FastAPI:
     app = FastAPI(title='diffman')
     app.state.registry = RunRegistry(root=root)
     app.state.scan_root = scan_root
-    app.state.submitter = submitter or default_submitter('auto')
     app.state.bcast = _Broadcaster()
     app.state.observer = None
+    app.state.scripts_observer = None
 
     if not no_scan:
         n = len(discovery.discover(scan_root))
-        print(f'[diffman] discovered {n} pipeline module(s) under {os.path.abspath(scan_root)}')
+        print(f'[diffman] discovered {n} pipeline module(s) under '
+              f'{os.path.abspath(scan_root)}')
 
     ui_dir = Path(__file__).parent / 'ui'
     app.mount('/static', StaticFiles(directory=str(ui_dir)), name='static')
@@ -209,51 +289,49 @@ def create_app(*,
     async def _startup():
         app.state.bcast.loop = asyncio.get_running_loop()
         if _HAS_WATCHDOG:
-            obs = Observer()
-            handler = _RunsWatcher(app.state.bcast, app.state.registry.root)
+            runs_obs = Observer()
+            runs_obs.schedule(
+                _RunsWatcher(app.state.bcast, app.state.registry,
+                             app.state.registry.root),
+                app.state.registry.root, recursive=True)
             os.makedirs(app.state.registry.root, exist_ok=True)
-            obs.schedule(handler, app.state.registry.root, recursive=True)
-            obs.start()
-            app.state.observer = obs
-            print('[diffman] watchdog: tailing', os.path.abspath(app.state.registry.root))
+            runs_obs.start()
+            app.state.observer = runs_obs
+            print('[diffman] watchdog: tailing runs at',
+                  os.path.abspath(app.state.registry.root))
+
+            scripts_obs = Observer()
+            scripts_obs.schedule(
+                _ScriptsWatcher(app.state.bcast, app.state.scan_root),
+                app.state.scan_root, recursive=True)
+            scripts_obs.start()
+            app.state.scripts_observer = scripts_obs
+            print('[diffman] watchdog: tailing pipeline sources at',
+                  os.path.abspath(app.state.scan_root))
 
     @app.on_event('shutdown')
     async def _shutdown():
-        if app.state.observer is not None:
-            app.state.observer.stop()
-            app.state.observer.join(timeout=2)
+        for obs_attr in ('observer', 'scripts_observer'):
+            obs = getattr(app.state, obs_attr, None)
+            if obs is not None:
+                obs.stop()
+                obs.join(timeout=2)
 
     # --- static SPA ------------------------------------------------------
     @app.get('/', response_class=HTMLResponse)
     def _index():
         return (ui_dir / 'index.html').read_text()
 
-    # --- discovery / modules --------------------------------------------
-    def _modules_payload():
-        return discovery.DISCOVERED_LIST
-
-    @app.get('/api/modules')
-    def _modules():
-        return {'modules': _modules_payload(),
-                'scan_root': os.path.abspath(app.state.scan_root)}
-
-    @app.get('/api/submitter')
-    def _submitter_info():
-        sub = app.state.submitter
-        defaults = getattr(sub, 'sbatch_flags', None)
+    # --- pipeline graph --------------------------------------------------
+    @app.get('/api/pipelines')
+    def _pipelines():
+        """Return the fork forest: roots → children, plus any orphans."""
+        metas = [_pipeline_meta(m['module'])
+                 for m in discovery.DISCOVERED_LIST]
         return {
-            'kind': sub.kind,
-            'accepts_sbatch_flags': sub.kind == 'slurm',
-            'default_sbatch_flags': list(defaults) if defaults else [],
+            'scan_root': os.path.abspath(app.state.scan_root),
+            'forest': _build_forest(metas),
         }
-
-    @app.get('/api/scan')
-    def _scan(root: Optional[str] = None):
-        if root:
-            app.state.scan_root = root
-        found = discovery.discover(app.state.scan_root)
-        return {'root': os.path.abspath(app.state.scan_root),
-                'modules': found}
 
     # --- variants / describe --------------------------------------------
     @app.get('/api/variants')
@@ -263,26 +341,269 @@ def create_app(*,
         except Exception as e:
             raise HTTPException(status_code=400,
                                 detail=f'import {module}: {e}')
-        #Prefer authoritative per-Variant module attribution (set at
-        #register() time). Fall back to the import-time diff captured by
-        #discovery.load_module for variants registered before this change.
-        names = _global_registry.for_module(module)
-        if not names:
-            names = discovery.module_variants(module)
-        return {'module': module, 'variants': names}
+        return {'module': module,
+                'variants': _global_registry.for_module(module)}
 
     @app.get('/api/describe')
-    def _describe(module: str, variant: str, var: list[str] = ()):
+    def _describe(module: str, variant: str):
         try:
             discovery.load_module(module)
-            base = _global_registry.get(variant)
+            v = _global_registry.get(module, variant)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
-        overrides = parse_overrides(var)
-        v = make_override_variant(base, overrides)
         return {'module': module, 'variant': v.name,
                 'fingerprint': v.fingerprint,
-                'config': v.config.merged()}
+                'base': v.base.name if v.base else None,
+                'forks_of': v.forks_of,
+                'overrides': dict(v.overrides),
+                'config': dict(v.config)}
+
+    @app.get('/api/variant_overrides')
+    def _variant_overrides(module: str, variant: str):
+        """Return what THIS variant adds on top of its inheritance base.
+
+        For `dm.register('jitter', base='base', probe=dict(jitter=True))`,
+        this returns the `probe=...` layer plus the base's merged config
+        for side-by-side comparison.
+        """
+        try:
+            discovery.load_module(module)
+            v = _global_registry.get(module, variant)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        base_cfg = dict(v.base.config) if v.base else {}
+        merged = dict(v.config)
+        return {
+            'module': module, 'variant': v.name,
+            'base': v.base.name if v.base else None,
+            'overrides': dict(v.overrides),
+            'base_config': base_cfg,
+            'config': merged,
+            'diff': diff_configs(base_cfg, merged),
+        }
+
+    # --- fork diff -------------------------------------------------------
+
+    def _resolve_parent_module(module: str) -> Optional[str]:
+        """Return the module that declares `Pipeline(<module>'s parent)`."""
+        try:
+            mod = discovery.load_module(module)
+        except Exception as e:
+            raise HTTPException(status_code=400,
+                                detail=f'import {module}: {e}')
+        pipe = getattr(mod, 'PIPELINE', None)
+        if pipe is None:
+            raise HTTPException(status_code=400,
+                                detail=f'{module} has no PIPELINE')
+        parent_name = pipe.parent
+        if not parent_name:
+            return None
+        #Fast path: the pipeline-name index is populated as modules load.
+        if parent_name in discovery.PIPELINE_TO_MODULE:
+            return discovery.PIPELINE_TO_MODULE[parent_name]
+        #Index miss — the parent may not have been imported yet. Walk
+        #(once) to populate.
+        for entry in discovery.DISCOVERED_LIST:
+            try:
+                discovery.load_module(entry['module'])
+            except Exception:
+                continue
+            if parent_name in discovery.PIPELINE_TO_MODULE:
+                return discovery.PIPELINE_TO_MODULE[parent_name]
+        raise HTTPException(
+            status_code=404,
+            detail=f'parent pipeline {parent_name!r} not found in scan')
+
+    @app.get('/api/diff')
+    def _diff(module: str):
+        """Diff every variant in `module` against its counterpart in the
+        parent pipeline. Counterparts are matched by `forks_of='name'` on
+        the child variant first, then by exact name.
+
+        Per-variant entries: 'only_in_child' / 'only_in_parent' /
+        'matches' / 'differs'.
+        """
+        try:
+            mod = discovery.load_module(module)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        pipe = mod.PIPELINE
+        parent_module = _resolve_parent_module(module)
+
+        def _bare_entry(cn):
+            cv = _global_registry.get(module, cn)
+            return {'variant': cn,
+                    'overrides': dict(cv.overrides),
+                    'base': cv.base.name if cv.base else None,
+                    'kind': 'no_parent'}
+
+        if parent_module is None:
+            #Root pipeline: still return its variants so the pipeline page
+            #renders without a second round-trip.
+            return {
+                'module': module, 'pipeline': pipe.name,
+                'parent_module': None, 'parent': None,
+                'variants': [_bare_entry(cn) for cn in
+                             sorted(_global_registry.for_module(module))],
+            }
+        discovery.load_module(parent_module)
+
+        child_names = _global_registry.for_module(module)
+        parent_names = set(_global_registry.for_module(parent_module))
+
+        #Build child→parent mapping. Explicit forks_of is authoritative —
+        #if the named target doesn't exist in the parent, surface it as
+        #'unresolved' rather than silently falling back to name match (a
+        #typo would otherwise pretend the diff worked).
+        child_to_parent: dict[str, Optional[str]] = {}
+        unresolved: dict[str, str] = {}
+        for cn in child_names:
+            cv = _global_registry.get(module, cn)
+            if cv.forks_of:
+                if cv.forks_of in parent_names:
+                    child_to_parent[cn] = cv.forks_of
+                else:
+                    child_to_parent[cn] = None
+                    unresolved[cn] = cv.forks_of
+            elif cn in parent_names:
+                child_to_parent[cn] = cn
+            else:
+                child_to_parent[cn] = None
+        matched_parent = {p for p in child_to_parent.values() if p}
+
+        per_variant = []
+        for cn in sorted(child_names):
+            pn = child_to_parent[cn]
+            cv = _global_registry.get(module, cn)
+            entry = {'variant': cn, 'overrides': dict(cv.overrides),
+                     'base': cv.base.name if cv.base else None}
+            if cn in unresolved:
+                entry['forks_of_unresolved'] = unresolved[cn]
+            if pn is None:
+                entry['kind'] = 'only_in_child'
+                per_variant.append(entry)
+                continue
+            child_cfg = dict(cv.config)
+            parent_cfg = dict(_global_registry.get(parent_module, pn).config)
+            d = diff_configs(parent_cfg, child_cfg)
+            entry['parent_variant'] = pn if pn != cn else None
+            entry['kind'] = 'matches' if not d else 'differs'
+            entry['entries'] = d
+            per_variant.append(entry)
+        for pn in sorted(parent_names - matched_parent):
+            per_variant.append({'variant': pn, 'kind': 'only_in_parent'})
+
+        return {
+            'module': module, 'pipeline': pipe.name,
+            'parent_module': parent_module, 'parent': pipe.parent,
+            'variants': per_variant,
+        }
+
+    @app.get('/api/source_diff')
+    def _source_diff(module: str):
+        """Unified text diff of this pipeline's .py against its parent's."""
+        import difflib
+        try:
+            mod = discovery.load_module(module)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        parent_module = _resolve_parent_module(module)
+        if parent_module is None:
+            return {'module': module, 'parent_module': None, 'diff': ''}
+        child_path = getattr(mod.PIPELINE, '_source_file', None)
+        parent_mod = discovery.load_module(parent_module)
+        parent_path = getattr(parent_mod.PIPELINE, '_source_file', None)
+        if not (child_path and parent_path):
+            raise HTTPException(status_code=404,
+                                detail='source file paths unavailable')
+        try:
+            child_src = Path(child_path).read_text().splitlines(keepends=True)
+            parent_src = Path(parent_path).read_text().splitlines(keepends=True)
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f'read failed: {e}')
+        unified = ''.join(difflib.unified_diff(
+            parent_src, child_src,
+            fromfile=os.path.basename(parent_path),
+            tofile=os.path.basename(child_path),
+            n=3))
+        return {
+            'module': module, 'parent_module': parent_module,
+            'parent_path': parent_path, 'child_path': child_path,
+            'diff': unified,
+        }
+
+    @app.get('/api/compare')
+    def _compare(modules: str, variant: str):
+        """N-way comparison of a same-named variant across modules.
+
+        `modules` is a comma-separated list. Returns per-module configs
+        plus a union-of-keys table showing the value each module has
+        (or null if absent).
+        """
+        mod_list = [m.strip() for m in modules.split(',') if m.strip()]
+        if len(mod_list) < 2:
+            raise HTTPException(status_code=400,
+                                detail='need at least 2 modules to compare')
+        columns = []
+        for m in mod_list:
+            try:
+                discovery.load_module(m)
+                v = _global_registry.get(m, variant)
+                columns.append({'module': m, 'present': True,
+                                'fingerprint': v.fingerprint,
+                                'config': dict(v.config)})
+            except (KeyError, Exception) as e:
+                columns.append({'module': m, 'present': False,
+                                'error': str(e), 'config': {}})
+
+        rows = _flatten_union([c['config'] for c in columns])
+        return {'variant': variant, 'columns': columns, 'rows': rows}
+
+    @app.get('/api/find')
+    def _find(q: str):
+        """Search by fingerprint prefix (or full) against variants + runs."""
+        q = q.strip().lower()
+        if len(q) < 4:
+            raise HTTPException(status_code=400,
+                                detail='query must be at least 4 chars')
+        #Make sure all discovered modules' variants are loaded.
+        for entry in discovery.DISCOVERED_LIST:
+            try:
+                discovery.load_module(entry['module'])
+            except Exception:
+                pass
+        variants = []
+        for v in list(_global_registry._variants.values()):
+            if v.fingerprint.startswith(q):
+                variants.append({
+                    'module': v.module, 'variant': v.name,
+                    'fingerprint': v.fingerprint,
+                })
+        runs = []
+        for r in app.state.registry.list_runs():
+            if r.fingerprint.startswith(q):
+                runs.append({
+                    'pipeline': r.pipeline, 'variant': r.variant,
+                    'short_fp': r.fingerprint[:12],
+                    'fingerprint': r.fingerprint,
+                    'started': r.started, 'ended': r.ended,
+                })
+        return {'query': q, 'variants': variants, 'runs': runs}
+
+    @app.get('/api/artifact_diff')
+    def _artifact_diff(path_a: str, path_b: str, target_max: int = 256):
+        """Numerical diff of two artifacts (.npy / .h5 / .json / text).
+
+        For arrays: shapes, element-wise stats of (b - a), and a
+        downsampled delta heatmap if 2-D. Different shapes → stats only.
+        For text/JSON: a unified text diff.
+        """
+        if not (_safe_under(path_a, app.state.registry.root) and
+                _safe_under(path_b, app.state.registry.root)):
+            raise HTTPException(status_code=400, detail='path escape')
+        if not (os.path.isfile(path_a) and os.path.isfile(path_b)):
+            raise HTTPException(status_code=404, detail='one or both paths missing')
+        return _compute_artifact_diff(path_a, path_b, target_max)
 
     # --- runs ------------------------------------------------------------
     def _summary(r):
@@ -341,6 +662,7 @@ def create_app(*,
             'artifacts': artifacts,
         }
 
+    # --- renderers -------------------------------------------------------
     @app.get('/api/render')
     def _render(path: str):
         if not _safe_under(path, app.state.registry.root):
@@ -361,14 +683,6 @@ def create_app(*,
                      row: int = -1,
                      col: int = -1,
                      target_max: int = 512):
-        """Return an SRW-aware preview: 2D heatmap + h/v cuts at (row, col).
-
-        - repr ∈ {intensity, amplitude, phase, real, imag}
-        - polarization ∈ {both, Ex, Ey} (wavefields only)
-        - energy_slice = -1 sums (intensity/amplitude) or picks center
-          (phase/real/imag).
-        - row/col = -1 means center cut.
-        """
         if not _safe_under(path, app.state.registry.root):
             raise HTTPException(status_code=400, detail='path escape')
         from . import srw_loaders
@@ -415,186 +729,6 @@ def create_app(*,
             raise HTTPException(status_code=404)
         return FileResponse(candidate)
 
-    # --- script forks ----------------------------------------------------
-    # A "script fork" is a real on-disk copy of a pipeline .py with a
-    # recorded parent. Distinct from an "override variant" (config tweak,
-    # in-memory only). The fork is editable and discoverable like any
-    # other pipeline module.
-
-    def _module_file(module: str) -> str:
-        d = discovery.DISCOVERED_PATHS.get(module)
-        if not d:
-            raise HTTPException(status_code=404,
-                                detail=f'unknown module {module!r}; rescan?')
-        path = os.path.join(d, f'{module}.py')
-        if not os.path.isfile(path):
-            raise HTTPException(status_code=404, detail=f'no file at {path}')
-        return path
-
-    _NAME_RE = __import__('re').compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
-
-    @app.get('/api/script')
-    def _get_script(module: str):
-        path = _module_file(module)
-        sidecar = path[:-3] + '.fork.json'
-        info = None
-        if os.path.isfile(sidecar):
-            try:
-                info = json.loads(Path(sidecar).read_text())
-            except Exception:
-                info = {'error': 'sidecar unreadable'}
-        return {'module': module, 'path': path,
-                'source': Path(path).read_text(),
-                'fork': info}
-
-    @app.put('/api/script')
-    async def _put_script(req: Request):
-        data = await req.json()
-        module = data.get('module')
-        source = data.get('source')
-        if not module or source is None:
-            raise HTTPException(status_code=400,
-                                detail='module and source required')
-        path = _module_file(module)
-        Path(path).write_text(source)
-        #Snapshot the edit into _scripts/.git/ for traceability.
-        try:
-            from .git_backup import snapshot
-            snapshot(app.state.registry.root, path,
-                     f'edit {module} via UI')
-        except Exception:
-            pass
-        return {'module': module, 'path': path, 'bytes': len(source)}
-
-    @app.post('/api/fork_script')
-    async def _fork_script(req: Request):
-        import re as _re
-        data = await req.json()
-        parent_module = data.get('parent_module')
-        new_name = (data.get('new_name') or '').strip()
-        if not parent_module or not new_name:
-            raise HTTPException(status_code=400,
-                                detail='parent_module and new_name required')
-        if not _NAME_RE.match(new_name):
-            raise HTTPException(status_code=400,
-                                detail='new_name must be a valid Python identifier')
-        parent_path = _module_file(parent_module)
-        parent_dir = os.path.dirname(parent_path)
-        new_path = os.path.join(parent_dir, f'{new_name}.py')
-        if os.path.exists(new_path):
-            raise HTTPException(status_code=409,
-                                detail=f'{new_path} already exists')
-
-        src = Path(parent_path).read_text()
-
-        #Rewrite the first `Pipeline('<parent_module>', ...)` literal so
-        #runs land under a distinct top-level dir. Parents that build the
-        #name dynamically are left alone; the user can edit by hand.
-        new_src, n_pipe = _re.subn(
-            r"""(Pipeline\s*\(\s*)(['"])""" + _re.escape(parent_module) + r"""\2""",
-            lambda m: f"{m.group(1)}{m.group(2)}{new_name}{m.group(2)}",
-            src, count=1)
-
-        #Rewrite variant names so the fork's dm.register() calls don't
-        #collide with the parent's when both modules are loaded in the
-        #same server process. We prefix every variant name in this file:
-        #`register('X', ...)` and `base='X'` both get the new prefix.
-        #Discover existing names by parsing the parent module's
-        #attributed variants.
-        discovery.load_module(parent_module)
-        existing = set(_global_registry.for_module(parent_module))
-        prefix = f'{new_name}__'
-
-        def _rename(m, existing=existing, prefix=prefix):
-            head, q, nm = m.group(1), m.group(2), m.group(3)
-            if nm in existing:
-                return f'{head}{q}{prefix}{nm}{q}'
-            return m.group(0)
-
-        # register('name', ...) / dm.register('name', ...)
-        new_src, n_reg = _re.subn(
-            r"""(\bregister\s*\(\s*)(['"])([A-Za-z_][A-Za-z0-9_]*)\2""",
-            _rename, new_src)
-        # base='name'
-        new_src, n_base = _re.subn(
-            r"""(\bbase\s*=\s*)(['"])([A-Za-z_][A-Za-z0-9_]*)\2""",
-            _rename, new_src)
-
-        Path(new_path).write_text(new_src)
-
-        sidecar = {
-            'parent_module': parent_module,
-            'parent_path': parent_path,
-            'created': time.strftime('%Y-%m-%dT%H:%M:%S'),
-            'pipeline_name_rewritten': bool(n_pipe),
-            'variant_prefix': prefix,
-            'variants_renamed': n_reg,
-            'base_refs_renamed': n_base,
-        }
-        sidecar_path = new_path[:-3] + '.fork.json'
-        Path(sidecar_path).write_text(json.dumps(sidecar, indent=2))
-
-        try:
-            from .git_backup import snapshot
-            snapshot(app.state.registry.root, new_path,
-                     f'fork {parent_module} -> {new_name}')
-            snapshot(app.state.registry.root, sidecar_path,
-                     f'fork sidecar for {new_name}')
-        except Exception:
-            pass
-
-        #Re-scan so the fork shows up in /api/modules.
-        discovery.discover(app.state.scan_root)
-        return {'module': new_name, 'path': new_path,
-                'sidecar': sidecar_path, 'sidecar_data': sidecar}
-
-    # --- launch ----------------------------------------------------------
-    @app.post('/api/launch')
-    async def _launch(req: Request):
-        data = await req.json()
-        module = data.get('module')
-        variant = data.get('variant')
-        if not module or not variant:
-            raise HTTPException(status_code=400,
-                                detail='module and variant required')
-        discovery.load_module(module)
-        base = _global_registry.get(variant)
-        overrides = parse_overrides(data.get('vars') or [])
-        ov = make_override_variant(base, overrides)
-        cmd = [sys.executable, '-m', 'diffman', 'run', module, variant,
-               '--runs-root', app.state.registry.root]
-        for k, v in flatten_overrides(overrides):
-            cmd += ['--var', f'{k}={v}']
-        if data.get('only'):
-            cmd += ['--only', data['only']]
-        if data.get('force'):
-            cmd += ['--force', data['force']]
-
-        log_dir = os.path.join(app.state.registry.root, '_jobs',
-                               f'{ov.name}_{ov.short_fingerprint()}')
-        env = os.environ.copy()
-        extra = discovery.DISCOVERED_PATHS.get(module)
-        if extra:
-            pp = env.get('PYTHONPATH', '')
-            env['PYTHONPATH'] = extra + (os.pathsep + pp if pp else '')
-        #Per-launch sbatch overrides. Accepts a shell-style string
-        #('--partition=regular --time=01:00:00') or a list of flags.
-        #Silently ignored by LocalSubmitter.
-        raw_flags = data.get('sbatch_flags')
-        if isinstance(raw_flags, str):
-            extra_flags = shlex.split(raw_flags)
-        elif isinstance(raw_flags, list):
-            extra_flags = list(raw_flags)
-        else:
-            extra_flags = None
-        info = app.state.submitter.submit(cmd, cwd=os.getcwd(),
-                                          env=env, log_dir=log_dir,
-                                          extra_flags=extra_flags)
-        info.update({'cmd': cmd, 'variant_name': ov.name,
-                     'variant_short_fp': ov.short_fingerprint()})
-        app.state.bcast.schedule({'type': 'launch', **info})
-        return info
-
     # --- websocket -------------------------------------------------------
     @app.websocket('/ws')
     async def _ws(ws: WebSocket):
@@ -633,6 +767,125 @@ def _stage_summaries(record) -> list[dict]:
     return out
 
 
+def _flatten_union(dicts: list[dict]) -> list[dict]:
+    """Flatten N nested dicts to dotted-path rows for an N-way compare.
+
+    Returns one row per leaf path, with a `values` list (one entry per
+    input dict, `None` if absent) and `equal: bool`.
+    """
+    def _walk(d, prefix=''):
+        out = {}
+        if not isinstance(d, dict):
+            out[prefix] = d
+            return out
+        for k, v in d.items():
+            p = f'{prefix}.{k}' if prefix else k
+            if isinstance(v, dict):
+                out.update(_walk(v, p))
+            else:
+                out[p] = v
+        return out
+
+    flat = [_walk(d) for d in dicts]
+    keys = sorted({k for f in flat for k in f.keys()})
+    sentinel = object()
+    rows = []
+    for k in keys:
+        vals = [f.get(k, sentinel) for f in flat]
+        present = [v if v is not sentinel else None for v in vals]
+        non_missing = [v for v in vals if v is not sentinel]
+        equal = (len(non_missing) == len(vals)
+                 and all(v == non_missing[0] for v in non_missing))
+        rows.append({'path': k, 'values': present, 'equal': equal})
+    return rows
+
+
+def _compute_artifact_diff(path_a: str, path_b: str, target_max: int) -> dict:
+    """Numerical or textual diff of two artifacts."""
+    import difflib
+    ext = os.path.splitext(path_a)[1].lower()
+    if os.path.splitext(path_b)[1].lower() != ext:
+        return {'kind': 'error',
+                'note': 'extensions differ; refusing to compare'}
+
+    if ext == '.npy':
+        try:
+            import numpy as np
+        except ImportError:
+            return {'kind': 'error', 'note': 'numpy not available'}
+        a = np.load(path_a, allow_pickle=False)
+        b = np.load(path_b, allow_pickle=False)
+        return _array_diff(a, b, target_max, paths=(path_a, path_b))
+
+    if ext in ('.h5', '.hdf5'):
+        return {'kind': 'error',
+                'note': 'h5 diff: pass dataset= via render_dataset for now'}
+
+    if ext in ('.json',):
+        try:
+            ja = json.loads(Path(path_a).read_text())
+            jb = json.loads(Path(path_b).read_text())
+        except Exception as e:
+            return {'kind': 'error', 'note': f'json load: {e}'}
+        if isinstance(ja, dict) and isinstance(jb, dict):
+            return {'kind': 'json_diff', 'entries': diff_configs(ja, jb)}
+        return {'kind': 'json_diff', 'a': ja, 'b': jb,
+                'equal': ja == jb}
+
+    #Text fallback for everything else.
+    try:
+        ta = Path(path_a).read_text().splitlines(keepends=True)
+        tb = Path(path_b).read_text().splitlines(keepends=True)
+    except UnicodeDecodeError:
+        return {'kind': 'error',
+                'note': f'binary file with no diff handler for {ext!r}'}
+    unified = ''.join(difflib.unified_diff(
+        ta, tb,
+        fromfile=os.path.basename(path_a),
+        tofile=os.path.basename(path_b),
+        n=3))
+    return {'kind': 'text_diff', 'diff': unified}
+
+
+def _array_diff(a, b, target_max: int, paths) -> dict:
+    """Numpy array diff: shapes + element-wise stats of (b-a)."""
+    import numpy as np
+    meta = {
+        'kind': 'array_diff',
+        'shape_a': list(a.shape), 'shape_b': list(b.shape),
+        'dtype_a': str(a.dtype),  'dtype_b': str(b.dtype),
+    }
+    if a.shape != b.shape:
+        meta['note'] = 'shapes differ; element-wise diff not computed'
+        return meta
+    d = b.astype(float) - a.astype(float)
+    abs_d = np.abs(d)
+    finite = np.isfinite(d)
+    if finite.any():
+        denom = np.maximum(np.abs(a.astype(float)),
+                           np.abs(b.astype(float)))
+        rel = np.where(denom > 0, abs_d / denom, 0.0)
+        meta['stats'] = {
+            'min':      float(d[finite].min()),
+            'max':      float(d[finite].max()),
+            'mean':     float(d[finite].mean()),
+            'abs_max':  float(abs_d[finite].max()),
+            'abs_mean': float(abs_d[finite].mean()),
+            'rms':      float(np.sqrt((d[finite] ** 2).mean())),
+            'rel_max':  float(rel[finite].max()),
+            'n_diff':   int((abs_d > 0).sum()),
+            'n_total':  int(d.size),
+        }
+    else:
+        meta['stats'] = None
+        meta['note'] = 'all-non-finite delta'
+    if d.ndim == 2:
+        from . import srw_loaders
+        delta_ds, _ = srw_loaders.downsample(d, target_max)
+        meta['delta_heatmap'] = delta_ds.tolist()
+    return meta
+
+
 def _safe_under(path: str, root: str) -> bool:
     real = os.path.realpath(path)
     base = os.path.realpath(root)
@@ -640,11 +893,10 @@ def _safe_under(path: str, root: str) -> bool:
 
 
 def run(*, root='runs', port=8765, bind='127.0.0.1',
-        scan_root='.', submitter=None, no_scan=False):
+        scan_root='.', no_scan=False):
     """Start the server (blocking). Convenience wrapper around uvicorn.run()."""
     import uvicorn
-    app = create_app(root=root, scan_root=scan_root,
-                     submitter=submitter, no_scan=no_scan)
+    app = create_app(root=root, scan_root=scan_root, no_scan=no_scan)
     if bind != '127.0.0.1':
         print(f'[diffman] warning: binding to {bind}; the UI is unauthenticated.',
               file=sys.stderr)
