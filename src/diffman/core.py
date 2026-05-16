@@ -43,25 +43,19 @@ def _caller_module() -> Optional[str]:
     return inspect.currentframe().f_back.f_back.f_globals.get('__name__')
 
 
-_SNAPSHOT_WARNED = False
-
-
 def _try_snapshot(root: str, source_file: str, message: str) -> None:
     """Best-effort git snapshot of a pipeline / chain source file.
 
-    Failures (no git, no write perms) are logged once and then silently
-    swallowed — snapshotting is a nice-to-have for traceability, never
-    a blocker for the actual run.
+    Snapshotting is traceability infrastructure, not a run prerequisite,
+    so failures don't propagate. They DO get logged at WARNING on every
+    occurrence — git_backup itself logs the specific git stderr; this
+    layer just ensures a snapshot failure never aborts a run.
     """
-    global _SNAPSHOT_WARNED
     try:
         from .git_backup import snapshot
         snapshot(root, source_file, message)
     except Exception as e:
-        if not _SNAPSHOT_WARNED:
-            _SNAPSHOT_WARNED = True
-            _log.warning('git_backup.snapshot failed (further failures '
-                         'will be silent): %s', e)
+        _log.warning('git_backup.snapshot failed: %s', e)
 
 
 # ---------------------------------------------------------------------------
@@ -688,10 +682,20 @@ def _now() -> str:
 
 
 def _git_rev() -> Optional[str]:
+    """Current git HEAD, or None if not in a repo / git not installed.
+
+    Catches only the failure modes we expect from `git rev-parse`:
+      - FileNotFoundError: no `git` on PATH
+      - CalledProcessError: not a repo, or repo has no commits yet
+      - TimeoutExpired: pathological I/O latency
+    Any other exception (e.g. OSError from a broken process state) is
+    a real bug and propagates.
+    """
     try:
         out = subprocess.check_output(
             ['git', 'rev-parse', 'HEAD'],
             stderr=subprocess.DEVNULL, timeout=2)
         return out.decode().strip()
-    except Exception:
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired):
         return None

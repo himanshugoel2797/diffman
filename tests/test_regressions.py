@@ -235,11 +235,13 @@ def test_list_runs_skips_malformed_with_warning(scan_root, caplog):
 
 
 # ---------------------------------------------------------------------------
-# core.py: snapshot() failures used to be silent forever. After the fix,
-# the first failure logs a warning.
+# core.py: snapshot() failures used to be silent forever; then logged
+# once per process; now logged on every occurrence so an ongoing
+# failure (corrupted _scripts repo, etc.) doesn't pretend to be working
+# after the first warning.
 # ---------------------------------------------------------------------------
 
-def test_snapshot_failure_is_logged_at_least_once(scan_root, monkeypatch,
+def test_snapshot_failure_is_logged_on_every_call(scan_root, monkeypatch,
                                                    caplog):
     from diffman import core
 
@@ -248,9 +250,6 @@ def test_snapshot_failure_is_logged_at_least_once(scan_root, monkeypatch,
 
     import diffman.git_backup as gb
     monkeypatch.setattr(gb, 'snapshot', boom)
-    #Reset the "already warned" flag so the warning fires for THIS test
-    #even if a previous one tripped it.
-    monkeypatch.setattr(core, '_SNAPSHOT_WARNED', False)
 
     v = core.registry.register('only', module='_diffman_test_snap', x=1)
     pipe = core.Pipeline('_pipe_snap', [core.Stage('sim', lambda ctx: None)])
@@ -258,7 +257,9 @@ def test_snapshot_failure_is_logged_at_least_once(scan_root, monkeypatch,
     reg = core.RunRegistry(root=str(scan_root / 'runs'))
     with caplog.at_level(logging.WARNING, logger='diffman.core'):
         pipe.run(v, reg)
-    assert any('snapshot failed' in rec.message for rec in caplog.records)
+        pipe.run(v, reg)   #second run; warn-once would have skipped this one
+    failures = [r for r in caplog.records if 'snapshot failed' in r.message]
+    assert len(failures) >= 2
 
 
 # ---------------------------------------------------------------------------

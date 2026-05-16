@@ -40,11 +40,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import time
 from pathlib import Path
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 from contextlib import asynccontextmanager
 
@@ -455,8 +458,13 @@ if _HAS_WATCHDOG:
             #Re-discover (a brand-new file would not be in PATH_TO_MODULE).
             try:
                 discovery.discover(self.scan_root)
-            except Exception:
-                pass
+            except OSError as e:
+                #Discovery is grep-based and never imports user code, so
+                #the only realistic failure is filesystem-level (perm,
+                #ENOENT) — surface it so the user sees their watcher is
+                #broken rather than silently stuck on stale data.
+                _log.warning('script watcher: discover(%s) failed: %s',
+                             self.scan_root, e)
             self.bcast.schedule({'type': 'pipelines_changed',
                                  'path': event.src_path,
                                  'event': event.event_type})
