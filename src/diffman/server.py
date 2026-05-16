@@ -46,6 +46,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -214,6 +216,60 @@ def _summarize_stage_status(stage_status: dict) -> str:
     return 'mixed'
 
 
+def _unified_file_diff(parent_path: Optional[str],
+                       child_path: Optional[str]) -> str:
+    """Read two .py files and return a unified text diff.
+
+    Shared by /api/source_diff (pipeline) and /api/chain_source_diff
+    (chain) — same operation, different upstream resolution of which
+    pair of paths to compare. Raises HTTPException on missing paths /
+    read errors so the endpoints surface a consistent status code.
+    """
+    import difflib
+    if not (parent_path and child_path):
+        raise HTTPException(status_code=404,
+                            detail='source file paths unavailable')
+    try:
+        child_src = Path(child_path).read_text().splitlines(keepends=True)
+        parent_src = Path(parent_path).read_text().splitlines(keepends=True)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f'read failed: {e}')
+    return ''.join(difflib.unified_diff(
+        parent_src, child_src,
+        fromfile=os.path.basename(parent_path),
+        tofile=os.path.basename(child_path),
+        n=3))
+
+
+def _resolve_forks_of(child_to_forks_of: dict[str, Optional[str]],
+                      child_names: set[str],
+                      parent_names: set[str]
+                      ) -> tuple[dict[str, Optional[str]], dict[str, str]]:
+    """Build a child→parent map honoring explicit ``forks_of=`` first,
+    falling back to name-match. A `forks_of` target that doesn't exist in
+    the parent is surfaced via the second return value rather than
+    silently swallowed (a typo would otherwise pretend the diff worked).
+
+    Used by /api/diff (variant forks across modules) and /api/chain_diff
+    (variation forks across chains) — same pattern, different domain.
+    """
+    child_to_parent: dict[str, Optional[str]] = {}
+    unresolved: dict[str, str] = {}
+    for cn in child_names:
+        fo = child_to_forks_of.get(cn)
+        if fo:
+            if fo in parent_names:
+                child_to_parent[cn] = fo
+            else:
+                child_to_parent[cn] = None
+                unresolved[cn] = fo
+        elif cn in parent_names:
+            child_to_parent[cn] = cn
+        else:
+            child_to_parent[cn] = None
+    return child_to_parent, unresolved
+
+
 def _load_stage_metrics(fdir: str):
     """Yield ``(stage_name, metrics_dict)`` for each stage under `fdir`
     that has a parseable metrics.json. Skips silently on missing or
@@ -229,6 +285,34 @@ def _load_stage_metrics(fdir: str):
             continue
         if isinstance(data, dict):
             yield st_name, data
+
+
+def _scoreboard_rows(chain, all_runs) -> tuple[list[dict], set[str]]:
+    """Aggregate ``<step>.<stage>.<metric>`` -> value across a chain's
+    variations. Returns (rows, all_metric_keys) where each row is
+    ``{'variation': name, 'metrics': flat_dict}``. Malformed variations
+    (resolve raises) are skipped. Shared by /api/scoreboard and the
+    `diffman scoreboard` CLI so the two stay in lock-step.
+    """
+    rows: list[dict] = []
+    all_metric_keys: set[str] = set()
+    for var_name, var in chain.variations.items():
+        try:
+            matched = _resolve_variation_runs(chain, var, all_runs)
+        except KeyError:
+            continue   #malformed variation (e.g. unresolved base=)
+        flat: dict = {}
+        for step in chain.steps:
+            run = matched[step.name]
+            if run is None:
+                continue
+            for st_name, st_metrics in _load_stage_metrics(run.fdir):
+                for k, v in st_metrics.items():
+                    key = f'{step.name}.{st_name}.{k}'
+                    flat[key] = v
+                    all_metric_keys.add(key)
+        rows.append({'variation': var_name, 'metrics': flat})
+    return rows, all_metric_keys
 
 
 def _load_chain(name: str):
@@ -384,23 +468,8 @@ if _HAS_WATCHDOG:
 
 def create_app(*, root: str = 'runs', scan_root: str = '.',
                no_scan: bool = False) -> FastAPI:
-    app = FastAPI(title='diffman')
-    app.state.registry = RunRegistry(root=root)
-    app.state.scan_root = scan_root
-    app.state.bcast = _Broadcaster()
-    app.state.observer = None
-    app.state.scripts_observer = None
-
-    if not no_scan:
-        n = len(discovery.discover(scan_root))
-        print(f'[diffman] discovered {n} pipeline module(s) under '
-              f'{os.path.abspath(scan_root)}')
-
-    ui_dir = Path(__file__).parent / 'ui'
-    app.mount('/static', StaticFiles(directory=str(ui_dir)), name='static')
-
-    @app.on_event('startup')
-    async def _startup():
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
         app.state.bcast.loop = asyncio.get_running_loop()
         if _HAS_WATCHDOG:
             runs_obs = Observer()
@@ -422,14 +491,29 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
             app.state.scripts_observer = scripts_obs
             print('[diffman] watchdog: tailing pipeline sources at',
                   os.path.abspath(app.state.scan_root))
+        try:
+            yield
+        finally:
+            for obs_attr in ('observer', 'scripts_observer'):
+                obs = getattr(app.state, obs_attr, None)
+                if obs is not None:
+                    obs.stop()
+                    obs.join(timeout=2)
 
-    @app.on_event('shutdown')
-    async def _shutdown():
-        for obs_attr in ('observer', 'scripts_observer'):
-            obs = getattr(app.state, obs_attr, None)
-            if obs is not None:
-                obs.stop()
-                obs.join(timeout=2)
+    app = FastAPI(title='diffman', lifespan=_lifespan)
+    app.state.registry = RunRegistry(root=root)
+    app.state.scan_root = scan_root
+    app.state.bcast = _Broadcaster()
+    app.state.observer = None
+    app.state.scripts_observer = None
+
+    if not no_scan:
+        n = len(discovery.discover(scan_root))
+        print(f'[diffman] discovered {n} pipeline module(s) under '
+              f'{os.path.abspath(scan_root)}')
+
+    ui_dir = Path(__file__).parent / 'ui'
+    app.mount('/static', StaticFiles(directory=str(ui_dir)), name='static')
 
     # --- static SPA ------------------------------------------------------
     @app.get('/', response_class=HTMLResponse)
@@ -566,24 +650,10 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
         child_names = _global_registry.for_module(module)
         parent_names = set(_global_registry.for_module(parent_module))
 
-        #Build child→parent mapping. Explicit forks_of is authoritative —
-        #if the named target doesn't exist in the parent, surface it as
-        #'unresolved' rather than silently falling back to name match (a
-        #typo would otherwise pretend the diff worked).
-        child_to_parent: dict[str, Optional[str]] = {}
-        unresolved: dict[str, str] = {}
-        for cn in child_names:
-            cv = _global_registry.get(module, cn)
-            if cv.forks_of:
-                if cv.forks_of in parent_names:
-                    child_to_parent[cn] = cv.forks_of
-                else:
-                    child_to_parent[cn] = None
-                    unresolved[cn] = cv.forks_of
-            elif cn in parent_names:
-                child_to_parent[cn] = cn
-            else:
-                child_to_parent[cn] = None
+        child_to_forks_of = {
+            cn: _global_registry.get(module, cn).forks_of for cn in child_names}
+        child_to_parent, unresolved = _resolve_forks_of(
+            child_to_forks_of, set(child_names), parent_names)
         matched_parent = {p for p in child_to_parent.values() if p}
 
         per_variant = []
@@ -617,7 +687,6 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
     @app.get('/api/source_diff')
     def _source_diff(module: str):
         """Unified text diff of this pipeline's .py against its parent's."""
-        import difflib
         try:
             mod = discovery.load_module(module)
         except Exception as e:
@@ -628,23 +697,10 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
         child_path = getattr(mod.PIPELINE, '_source_file', None)
         parent_mod = discovery.load_module(parent_module)
         parent_path = getattr(parent_mod.PIPELINE, '_source_file', None)
-        if not (child_path and parent_path):
-            raise HTTPException(status_code=404,
-                                detail='source file paths unavailable')
-        try:
-            child_src = Path(child_path).read_text().splitlines(keepends=True)
-            parent_src = Path(parent_path).read_text().splitlines(keepends=True)
-        except OSError as e:
-            raise HTTPException(status_code=500, detail=f'read failed: {e}')
-        unified = ''.join(difflib.unified_diff(
-            parent_src, child_src,
-            fromfile=os.path.basename(parent_path),
-            tofile=os.path.basename(child_path),
-            n=3))
         return {
             'module': module, 'parent_module': parent_module,
             'parent_path': parent_path, 'child_path': child_path,
-            'diff': unified,
+            'diff': _unified_file_diff(parent_path, child_path),
         }
 
     @app.get('/api/compare')
@@ -803,29 +859,15 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
     @app.get('/api/chain_source_diff')
     def _chain_source_diff(chain: str):
         """Unified text diff of this chain's .py against its parent chain's."""
-        import difflib
         ch, _ = _load_chain(chain)
         if not ch.parent:
             return {'chain': chain, 'parent': None, 'diff': ''}
         parent_ch, _ = _load_chain(ch.parent)
         child_path = getattr(ch, '_source_file', None)
         parent_path = getattr(parent_ch, '_source_file', None)
-        if not (child_path and parent_path):
-            raise HTTPException(status_code=404,
-                                detail='source file paths unavailable')
-        try:
-            child_src = Path(child_path).read_text().splitlines(keepends=True)
-            parent_src = Path(parent_path).read_text().splitlines(keepends=True)
-        except OSError as e:
-            raise HTTPException(status_code=500, detail=f'read failed: {e}')
-        unified = ''.join(difflib.unified_diff(
-            parent_src, child_src,
-            fromfile=os.path.basename(parent_path),
-            tofile=os.path.basename(child_path),
-            n=3))
         return {'chain': chain, 'parent': ch.parent,
                 'parent_path': parent_path, 'child_path': child_path,
-                'diff': unified}
+                'diff': _unified_file_diff(parent_path, child_path)}
 
     @app.get('/api/chain_diff')
     def _chain_diff(chain: str):
@@ -839,29 +881,26 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
         """
         ch, _ = _load_chain(chain)
         if not ch.parent:
-            return {'chain': chain, 'parent': None,
-                    'variations': [{'variation': v.name,
-                                    'mapping': v.resolve(),
-                                    'kind': 'no_parent'}
-                                   for v in ch.variations.values()]}
+            #Mirror the non-root branch: tolerate variations that fail to
+            #resolve (e.g. base= points at something missing) by surfacing
+            #the error rather than 500'ing the whole endpoint.
+            out_root = []
+            for v in ch.variations.values():
+                try:
+                    out_root.append({'variation': v.name,
+                                     'mapping': v.resolve(),
+                                     'kind': 'no_parent'})
+                except Exception as e:
+                    out_root.append({'variation': v.name,
+                                     'kind': 'unresolved',
+                                     'error': str(e)})
+            return {'chain': chain, 'parent': None, 'variations': out_root}
         parent_ch, _ = _load_chain(ch.parent)
         child_names = set(ch.variations)
         parent_names = set(parent_ch.variations)
-        #Build child→parent mapping, surfacing unresolved forks_of typos
-        #the way /api/diff does for variants.
-        c_to_p: dict[str, Optional[str]] = {}
-        unresolved: dict[str, str] = {}
-        for cn, cv in ch.variations.items():
-            if cv.forks_of:
-                if cv.forks_of in parent_names:
-                    c_to_p[cn] = cv.forks_of
-                else:
-                    c_to_p[cn] = None
-                    unresolved[cn] = cv.forks_of
-            elif cn in parent_names:
-                c_to_p[cn] = cn
-            else:
-                c_to_p[cn] = None
+        c_to_p, unresolved = _resolve_forks_of(
+            {cn: cv.forks_of for cn, cv in ch.variations.items()},
+            child_names, parent_names)
         matched_parent = {p for p in c_to_p.values() if p}
 
         out = []
@@ -964,25 +1003,8 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
             raise HTTPException(
                 status_code=404,
                 detail=f'baseline variation {baseline!r} not in chain {name!r}')
-        all_runs = app.state.registry.list_runs()
-        rows = []
-        all_metric_keys: set[str] = set()
-        for var_name, var in chain.variations.items():
-            try:
-                matched = _resolve_variation_runs(chain, var, all_runs)
-            except KeyError:
-                continue   #malformed variation (e.g. unresolved base=)
-            flat: dict = {}
-            for step in chain.steps:
-                run = matched[step.name]
-                if run is None:
-                    continue
-                for st_name, st_metrics in _load_stage_metrics(run.fdir):
-                    for k, v in st_metrics.items():
-                        key = f'{step.name}.{st_name}.{k}'
-                        flat[key] = v
-                        all_metric_keys.add(key)
-            rows.append({'variation': var_name, 'metrics': flat})
+        rows, all_metric_keys = _scoreboard_rows(
+            chain, app.state.registry.list_runs())
 
         if baseline is not None:
             base_row = next((r for r in rows if r['variation'] == baseline), {})
@@ -1206,8 +1228,14 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
 
     @app.get('/artifact/{pipeline}/{variant}/{short_fp}/{rest:path}')
     def _artifact(pipeline: str, variant: str, short_fp: str, rest: str):
+        #Normalize textually (which collapses `..`) so a maliciously
+        #crafted `rest` segment can't escape, but don't realpath the
+        #candidate — artifacts registered via ctx.artifact() are
+        #symlinks pointing outside the runs tree and must remain
+        #serveable. `os.path.isfile` follows the symlink for the
+        #existence check.
         base = os.path.realpath(app.state.registry.root)
-        candidate = os.path.realpath(
+        candidate = os.path.normpath(
             os.path.join(base, pipeline, variant, short_fp, rest))
         if not candidate.startswith(base + os.sep):
             raise HTTPException(status_code=400, detail='path escape')
@@ -1383,7 +1411,12 @@ def _array_diff(a, b, target_max: int, paths) -> dict:
     if finite.any():
         denom = np.maximum(np.abs(a.astype(float)),
                            np.abs(b.astype(float)))
-        rel = np.where(denom > 0, abs_d / denom, 0.0)
+        #Mask the divide to avoid a RuntimeWarning when denom has zeros —
+        #the np.where chooses the 0.0 branch for those slots regardless,
+        #but the unmasked division still trips numpy's divide warning.
+        rel = np.zeros_like(d, dtype=float)
+        mask = denom > 0
+        rel[mask] = abs_d[mask] / denom[mask]
         meta['stats'] = {
             'min':      float(d[finite].min()),
             'max':      float(d[finite].max()),
@@ -1420,9 +1453,20 @@ def _array_diff(a, b, target_max: int, paths) -> dict:
 
 
 def _safe_under(path: str, root: str) -> bool:
-    real = os.path.realpath(path)
+    """True iff `path` (after textual normalization) lies inside `root`.
+
+    Only the textual path is normalized — we don't `realpath` it so that
+    artifacts registered via ``ctx.artifact`` (which symlinks from the
+    user's working area into runs/) remain reachable. The runs root
+    itself is resolved so symlinked runs roots (CI tmpdirs on macOS,
+    for instance) are matched correctly.
+
+    Path-traversal attacks via ``..`` in the URL still fail: normpath
+    collapses those before the prefix test.
+    """
     base = os.path.realpath(root)
-    return real == base or real.startswith(base + os.sep)
+    p = os.path.normpath(os.path.abspath(path))
+    return p == base or p.startswith(base + os.sep)
 
 
 def run(*, root='runs', port=8765, bind='127.0.0.1',

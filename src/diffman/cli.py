@@ -149,26 +149,9 @@ def _cmd_scoreboard(args):
     """Print the variation × metric table for a chain. Mirrors
     /api/scoreboard; -b/--baseline picks a row whose metrics other rows
     are shown as deltas against (numeric only)."""
-    from .server import _resolve_variation_runs, _load_stage_metrics
+    from .server import _scoreboard_rows
     ch = _find_chain(args.chain, args.scan_root)
-    all_runs = RunRegistry(args.root).list_runs()
-    rows = []
-    keys: set = set()
-    for var_name, var in ch.variations.items():
-        try:
-            matched = _resolve_variation_runs(ch, var, all_runs)
-        except KeyError:
-            continue
-        flat: dict = {}
-        for step in ch.steps:
-            r = matched[step.name]
-            if r is None:
-                continue
-            for st_name, st_metrics in _load_stage_metrics(r.fdir):
-                for k, v in st_metrics.items():
-                    flat[f'{step.name}.{st_name}.{k}'] = v
-                    keys.add(f'{step.name}.{st_name}.{k}')
-        rows.append({'variation': var_name, 'metrics': flat})
+    rows, keys = _scoreboard_rows(ch, RunRegistry(args.root).list_runs())
     if args.baseline:
         base = next((r for r in rows if r['variation'] == args.baseline), None)
         if base is None:

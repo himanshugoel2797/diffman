@@ -206,6 +206,30 @@ class TestFind:
         c, _ = client
         assert c.get('/api/find?q=abc').status_code == 400
 
+    def test_find_returns_runs_by_fp_prefix(self, scan_root, make_pipeline):
+        """The `runs` half of /api/find: when a run.json exists whose
+        fingerprint starts with the query, it must come back in the
+        `runs` list. Previously only the `variants` half was covered."""
+        from diffman import discovery
+        from diffman.core import registry, RunRegistry
+        import sys
+        make_pipeline('_diffman_test_find_runs', """
+            import diffman as dm
+            dm.register('base', x=42)
+            def _f(ctx): pass
+            PIPELINE = dm.Pipeline('_p_find_runs', [dm.Stage('s', _f)])
+        """)
+        discovery.load_module('_diffman_test_find_runs')
+        rr = RunRegistry(root=str(scan_root / 'runs'))
+        rec = sys.modules['_diffman_test_find_runs'].PIPELINE.run(
+            registry.get('_diffman_test_find_runs', 'base'), rr)
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=True)
+        with TestClient(app) as c:
+            r = c.get(f'/api/find?q={rec.fingerprint[:8]}').json()
+        assert any(run['fingerprint'] == rec.fingerprint for run in r['runs'])
+        assert all(run['pipeline'] == '_p_find_runs' for run in r['runs'])
+
 
 class TestArtifactDiff:
     def test_array_diff_reports_stats_and_heatmap(self, client):
@@ -283,11 +307,38 @@ class TestRunDetailStageTimings:
 
     def test_run_endpoint_timing_is_none_for_pending_stage(
             self, scan_root, make_pipeline):
-        """Stages that haven't run (no _meta.json yet) must surface
-        with started/ended/duration_s = None, not crash."""
-        #Hand-craft a run dir with no stages dir at all.
-        from diffman.core import RunRegistry, registry as reg
-        reg.register('only', module='_diffman_test_empty', x=1)
+        """A stage whose directory exists (it's been touched by run
+        bookkeeping) but whose _meta.json hasn't been written yet — i.e.
+        the stage truly is pending — must surface with
+        started/ended/duration_s = None, not crash."""
+        rd = scan_root / 'runs' / '_pipe_pending' / 'only' / 'abcabcabcabc'
+        rd.mkdir(parents=True)
+        #Create stages/sim/ with NO _meta.json — this is what a queued
+        #stage looks like on disk before it starts running.
+        (rd / 'stages' / 'sim').mkdir(parents=True)
+        (rd / 'run.json').write_text(json.dumps({
+            'pipeline': '_pipe_pending', 'variant': 'only',
+            'fingerprint': 'abcabcabcabc' + '0'*52,
+            'fdir': str(rd),
+            'started': '2026-01-01T00:00:00',
+            'stage_keys': {}, 'stage_status': {'sim': 'pending'}, 'errors': {},
+        }))
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=True)
+        with TestClient(app) as c:
+            d = c.get('/api/run/_pipe_pending/only/abcabcabcabc').json()
+        assert len(d['stages']) == 1
+        st = d['stages'][0]
+        assert st['name'] == 'sim'
+        assert st['status'] == 'pending'
+        assert st['started'] is None
+        assert st['ended'] is None
+        assert st['duration_s'] is None
+
+    def test_run_endpoint_stages_empty_when_stages_dir_missing(
+            self, scan_root):
+        """A run whose stages/ directory is missing entirely (failed at
+        the open_run step) must return stages: [] rather than crash."""
         rd = scan_root / 'runs' / '_pipe_empty' / 'only' / 'abcabcabcabc'
         rd.mkdir(parents=True)
         (rd / 'run.json').write_text(json.dumps({
@@ -633,3 +684,278 @@ class TestDiscoveryEviction:
         discovery.evict_module('_diffman_test_evict')
         assert core.registry.for_module('_diffman_test_evict') == []
         assert '_pipe_evict' not in discovery.PIPELINE_TO_MODULE
+
+
+# ---------------------------------------------------------------------------
+# /api/render: dispatch to the renderer + safe_under path check
+# ---------------------------------------------------------------------------
+
+class TestRenderEndpoint:
+    def _stage_with_artifact(self, scan_root, make_pipeline,
+                              module_name, pipe_name, write_bytes):
+        """Run a one-stage pipeline that writes `write_bytes` to a file
+        registered as an artifact, and return its absolute path."""
+        make_pipeline(module_name, f"""
+            import diffman as dm
+            dm.register('base', x=1)
+            def _f(ctx):
+                import os, tempfile
+                p = os.path.join(tempfile.mkdtemp(), 'a.txt')
+                open(p, 'wb').write({write_bytes!r})
+                ctx.artifact('s', 'a.txt', p)
+            PIPELINE = dm.Pipeline({pipe_name!r}, [dm.Stage('s', _f)])
+        """)
+        from diffman import discovery
+        from diffman.core import registry, RunRegistry
+        import sys
+        discovery.load_module(module_name)
+        rr = RunRegistry(root=str(scan_root / 'runs'))
+        rec = sys.modules[module_name].PIPELINE.run(
+            registry.get(module_name, 'base'), rr)
+        return os.path.join(rec.fdir, 'stages', 's', 'outputs', 'a.txt')
+
+    def test_render_returns_text_payload_for_txt(self, scan_root,
+                                                   make_pipeline):
+        p = self._stage_with_artifact(scan_root, make_pipeline,
+                                      '_diffman_test_render_a',
+                                      '_p_render_a', b'hello world')
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=True)
+        with TestClient(app) as c:
+            r = c.get(f'/api/render?path={p}').json()
+        assert r['kind'] == 'text'
+        assert r['data'] == 'hello world'
+
+    def test_render_rejects_path_escape(self, scan_root, make_pipeline):
+        """A path outside the runs root must be refused — same protection
+        the artifact_diff endpoint has, but the lone-file render endpoint
+        is a separate code path and needs its own guard."""
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=True)
+        with TestClient(app) as c:
+            assert c.get('/api/render?path=/etc/passwd').status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# /api/stage: list artifacts + status for one (pipeline, variant, run, stage)
+# ---------------------------------------------------------------------------
+
+class TestStageEndpoint:
+    def test_stage_lists_artifacts_with_size_and_path(self, scan_root,
+                                                       make_pipeline):
+        make_pipeline('_diffman_test_stage_art', """
+            import diffman as dm
+            dm.register('base', x=1)
+            def _f(ctx):
+                import os, tempfile
+                d = tempfile.mkdtemp()
+                p1 = os.path.join(d, 'a.txt'); open(p1, 'wb').write(b'AAA')
+                p2 = os.path.join(d, 'b.bin'); open(p2, 'wb').write(b'\\x00'*7)
+                ctx.artifact('s', 'a.txt', p1)
+                ctx.artifact('s', 'sub/b.bin', p2)
+            PIPELINE = dm.Pipeline('_p_stage_art', [dm.Stage('s', _f)])
+        """)
+        from diffman import discovery
+        from diffman.core import registry, RunRegistry
+        import sys
+        discovery.load_module('_diffman_test_stage_art')
+        rr = RunRegistry(root=str(scan_root / 'runs'))
+        rec = sys.modules['_diffman_test_stage_art'].PIPELINE.run(
+            registry.get('_diffman_test_stage_art', 'base'), rr)
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=True)
+        with TestClient(app) as c:
+            d = c.get(f'/api/stage/_p_stage_art/base/'
+                      f'{rec.fingerprint[:12]}/s').json()
+        assert d['stage'] == 's'
+        assert d['status'] in ('done', 'cached')
+        paths = sorted(a['path'] for a in d['artifacts'])
+        assert paths == [
+            os.path.join('stages', 's', 'outputs', 'a.txt'),
+            os.path.join('stages', 's', 'outputs', 'sub', 'b.bin'),
+        ]
+        sizes = {a['path'].rsplit(os.sep, 1)[-1]: a['size']
+                 for a in d['artifacts']}
+        assert sizes['a.txt'] == 3
+        assert sizes['b.bin'] == 7
+
+    def test_stage_404_for_unknown_run(self, scan_root, make_pipeline):
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=True)
+        with TestClient(app) as c:
+            r = c.get('/api/stage/ghost/v/ffffffffffff/s')
+        assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# /artifact/{pipeline}/{variant}/{fp}/{rest}: raw file download + escape
+# ---------------------------------------------------------------------------
+
+class TestArtifactDownload:
+    def test_artifact_route_serves_file_bytes(self, scan_root, make_pipeline):
+        make_pipeline('_diffman_test_dl', """
+            import diffman as dm
+            dm.register('base', x=1)
+            def _f(ctx):
+                import os, tempfile
+                p = os.path.join(tempfile.mkdtemp(), 'out.bin')
+                open(p, 'wb').write(b'PAYLOAD_BYTES')
+                ctx.artifact('s', 'out.bin', p)
+            PIPELINE = dm.Pipeline('_p_dl', [dm.Stage('s', _f)])
+        """)
+        from diffman import discovery
+        from diffman.core import registry, RunRegistry
+        import sys
+        discovery.load_module('_diffman_test_dl')
+        rr = RunRegistry(root=str(scan_root / 'runs'))
+        rec = sys.modules['_diffman_test_dl'].PIPELINE.run(
+            registry.get('_diffman_test_dl', 'base'), rr)
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=True)
+        with TestClient(app) as c:
+            r = c.get(f'/artifact/_p_dl/base/{rec.fingerprint[:12]}'
+                      '/stages/s/outputs/out.bin')
+        assert r.status_code == 200
+        assert r.content == b'PAYLOAD_BYTES'
+
+    def test_artifact_route_404_for_missing_file(self, scan_root):
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=True)
+        with TestClient(app) as c:
+            r = c.get('/artifact/p/v/000000000000/stages/s/outputs/nope')
+        assert r.status_code == 404
+
+    def test_artifact_route_rejects_path_escape(self, scan_root):
+        """A `rest` segment with `..` traversal must not escape the runs
+        root. Goes through os.path.realpath so symlinks are resolved
+        before the prefix check."""
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=True)
+        with TestClient(app) as c:
+            r = c.get('/artifact/p/v/fp/..%2F..%2F..%2Fetc%2Fpasswd')
+        # FastAPI may either normalize the path-encoded ../ during routing
+        # (giving 404) or pass it through and let our explicit check fire
+        # (giving 400). Either is a refusal — what matters is the file
+        # at /etc/passwd is never served.
+        assert r.status_code in (400, 404)
+
+
+# ---------------------------------------------------------------------------
+# _resolve_variation_runs: upstream-fp join used by both /api/chain_progress
+# and /api/scoreboard. The endpoints test it transitively but the helper
+# itself has no direct unit test, and its early-exit-when-upstream-pending
+# branch is subtle enough to deserve one.
+# ---------------------------------------------------------------------------
+
+class TestResolveVariationRuns:
+    def test_short_circuits_when_required_upstream_missing(self, scan_root,
+                                                            make_pipeline):
+        """When a step's required upstream couldn't be matched, the
+        downstream step must not be attributed to *any* run — even a
+        same-(pipeline, variant) run whose upstream points elsewhere."""
+        import diffman as dm
+        from diffman import discovery
+        from diffman.server import _resolve_variation_runs
+        import sys
+        make_pipeline('_diffman_test_rvr_a', """
+            import diffman as dm
+            dm.register('base', x=1)
+            def _f(ctx): pass
+            PIPELINE = dm.Pipeline('_p_rvr_a', [dm.Stage('s', _f)])
+        """)
+        make_pipeline('_diffman_test_rvr_b', """
+            import diffman as dm
+            dm.register('base', y=1)
+            def _f(ctx): pass
+            PIPELINE = dm.Pipeline('_p_rvr_b', [dm.Stage('s', _f)])
+        """)
+        discovery.load_module('_diffman_test_rvr_a')
+        discovery.load_module('_diffman_test_rvr_b')
+        chain = dm.Chain('rvrchain', steps=[
+            dm.ChainStep('up', sys.modules['_diffman_test_rvr_a'].PIPELINE),
+            dm.ChainStep('down', sys.modules['_diffman_test_rvr_b'].PIPELINE,
+                         consumes=('up',)),
+        ])
+        chain.variation('v', up='base', down='base')
+        rr = dm.RunRegistry(root=str(scan_root / 'runs'))
+        #Only the downstream pipeline run exists — no upstream run.
+        sys.modules['_diffman_test_rvr_b'].PIPELINE.run(
+            dm.registry.get('_diffman_test_rvr_b', 'base'), rr)
+        matched = _resolve_variation_runs(chain, chain.variations['v'],
+                                          rr.list_runs())
+        assert matched['up'] is None
+        # Downstream's run.upstream == {} but the chain expects
+        # upstream={'up': <up_fp>} — so down must NOT be matched, even
+        # though a (_p_rvr_b, base) run exists on disk.
+        assert matched['down'] is None
+
+    def test_unspecified_step_is_none(self, scan_root, make_pipeline):
+        """A variation that doesn't specify a variant for a step must
+        produce None for that step (not an error), so endpoints can
+        report 'unspecified' status instead of crashing."""
+        import diffman as dm
+        from diffman import discovery
+        from diffman.server import _resolve_variation_runs
+        import sys
+        make_pipeline('_diffman_test_rvr_unspec', """
+            import diffman as dm
+            dm.register('base', x=1)
+            def _f(ctx): pass
+            PIPELINE = dm.Pipeline('_p_rvr_unspec', [dm.Stage('s', _f)])
+        """)
+        discovery.load_module('_diffman_test_rvr_unspec')
+        chain = dm.Chain('uspec', steps=[
+            dm.ChainStep('a', sys.modules['_diffman_test_rvr_unspec'].PIPELINE),
+            dm.ChainStep('b', sys.modules['_diffman_test_rvr_unspec'].PIPELINE),
+        ])
+        #Mapping only specifies `a`. With no `b=`, b is unspecified.
+        chain.variation('partial', a='base')
+        matched = _resolve_variation_runs(chain, chain.variations['partial'],
+                                          [])
+        assert matched == {'a': None, 'b': None}
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers: forks_of resolution + unified file diff
+# ---------------------------------------------------------------------------
+
+class TestResolveForksOf:
+    def test_explicit_forks_of_wins_over_name_match(self):
+        from diffman.server import _resolve_forks_of
+        c2p, unres = _resolve_forks_of(
+            {'a': 'parent_a', 'b': None},
+            child_names={'a', 'b'},
+            parent_names={'parent_a', 'a', 'b'},
+        )
+        # 'a' uses its explicit forks_of, not the name-match.
+        assert c2p['a'] == 'parent_a'
+        # 'b' falls through to name match.
+        assert c2p['b'] == 'b'
+        assert unres == {}
+
+    def test_unresolved_forks_of_surfaces(self):
+        from diffman.server import _resolve_forks_of
+        c2p, unres = _resolve_forks_of(
+            {'typo': 'gohst'},
+            child_names={'typo'},
+            parent_names={'ghost'},
+        )
+        assert c2p['typo'] is None
+        assert unres == {'typo': 'gohst'}
+
+
+class TestUnifiedFileDiff:
+    def test_returns_unified_diff_text(self, tmp_path):
+        from diffman.server import _unified_file_diff
+        p = tmp_path / 'p.py'; p.write_text('a\nb\nc\n')
+        c = tmp_path / 'c.py'; c.write_text('a\nB\nc\n')
+        out = _unified_file_diff(str(p), str(c))
+        assert '-b' in out and '+B' in out
+        assert 'p.py' in out and 'c.py' in out
+
+    def test_raises_404_when_either_path_missing(self, tmp_path):
+        from diffman.server import _unified_file_diff
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as ei:
+            _unified_file_diff(None, str(tmp_path / 'c.py'))
+        assert ei.value.status_code == 404
