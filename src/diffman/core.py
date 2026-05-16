@@ -298,7 +298,18 @@ class Pipeline:
             only: Optional[set] = None,
             upstream: Optional[dict] = None,
             chain: Optional[str] = None,
-            variation: Optional[str] = None) -> 'RunRecord':
+            variation: Optional[str] = None,
+            assume_cached: bool = False) -> 'RunRecord':
+        """Run the pipeline, caching per-stage on disk.
+
+        ``assume_cached=True`` is the resolve-but-don't-execute mode:
+        each stage must already be cached (its ``_key`` file present
+        and matching the recomputed key) or a ``RuntimeError`` is
+        raised. Used by ``Chain._run`` when only a single chain step
+        should actually execute and upstream steps merely need their
+        ``RunRecord`` resolved from disk — e.g., when a multi-step
+        chain is invoked once per ``srun`` geometry.
+        """
         force = set(force or ())
         only = set(only) if only else None
         ctx = registry.open_run(self.name, variant,
@@ -328,6 +339,13 @@ class Pipeline:
                     and key_file.read_text().strip() == key):
                 ctx.record.stage_status[stage.name] = 'cached'
                 continue
+
+            if assume_cached:
+                raise RuntimeError(
+                    f'stage {self.name}/{stage.name} is not cached '
+                    f'(expected key {key} at {key_file}); run the '
+                    f'preceding chain step(s) before targeting a '
+                    f'downstream step.')
 
             ctx.record.stage_status[stage.name] = 'running'
             registry._flush(ctx.record)
@@ -431,8 +449,36 @@ class Variation:
         out.update(self.overrides)
         return out
 
-    def run(self, run_registry: 'RunRegistry') -> dict:
-        return self.chain._run(self, run_registry)
+    def run(self, run_registry: 'RunRegistry', *,
+            step=None) -> dict:
+        """Execute the variation's chain.
+
+        ``step`` (int index, numeric string, or step name) targets a
+        single chain step: upstream steps are resolved from cache
+        (raising if they aren't fully cached) and downstream steps are
+        skipped. Used to invoke each step under its own ``srun``
+        geometry from a single entry-point script.
+        """
+        only = None
+        if step is not None and step != '':
+            steps = self.chain.steps
+            if isinstance(step, int) or (isinstance(step, str)
+                                         and step.lstrip('-').isdigit()):
+                idx = int(step)
+                if not 0 <= idx < len(steps):
+                    raise IndexError(
+                        f'chain step index {idx} out of range '
+                        f'[0, {len(steps)}) for chain '
+                        f'{self.chain.name!r}')
+                only = steps[idx].name
+            else:
+                names = [s.name for s in steps]
+                if step not in names:
+                    raise KeyError(
+                        f'chain step {step!r} not found in chain '
+                        f'{self.chain.name!r}; known steps: {names}')
+                only = step
+        return self.chain._run(self, run_registry, only_step=only)
 
 
 class Chain:
@@ -483,11 +529,28 @@ class Chain:
         self.variations[name] = v
         return v
 
-    def _run(self, variation: Variation, rr: 'RunRegistry') -> dict:
+    def _run(self, variation: Variation, rr: 'RunRegistry', *,
+             only_step: Optional[str] = None) -> dict:
+        """Execute the chain (or a single step of it).
+
+        With ``only_step`` set to a step name, every step *up to and
+        including* the target is entered, but the steps before it are
+        passed ``assume_cached=True`` — they must already be cached
+        on disk or a ``RuntimeError`` is raised. The target executes
+        normally; steps after it are not entered. Downstream code that
+        needs all steps' ``RunRecord``s should call without
+        ``only_step``.
+        """
         mapping = variation.resolve()
         if self._source_file:
             _try_snapshot(rr.root, self._source_file,
                           f'chain {self.name}/{variation.name}')
+        if only_step is not None:
+            names = [s.name for s in self.steps]
+            if only_step not in names:
+                raise KeyError(
+                    f'chain step {only_step!r} not in chain '
+                    f'{self.name!r}; known steps: {names}')
         runs: dict[str, RunRecord] = {}
         for step in self.steps:
             if step.name not in mapping:
@@ -500,10 +563,19 @@ class Chain:
                     f'pipeline {step.pipeline.name!r} has no module '
                     f'attribution; cannot resolve variant '
                     f'{mapping[step.name]!r} from the registry')
+            #When targeting a single step, resolve upstream steps from
+            #their on-disk cache instead of re-executing them — that
+            #keeps the runtime geometry of this srun appropriate for
+            #the *target* step only.
+            assume_cached = (only_step is not None
+                             and step.name != only_step)
             runs[step.name] = step.pipeline.run(
                 registry.get(module, mapping[step.name]), rr,
                 upstream={u: runs[u] for u in step.consumes},
-                chain=self.name, variation=variation.name)
+                chain=self.name, variation=variation.name,
+                assume_cached=assume_cached)
+            if step.name == only_step:
+                break
         return runs
 
 

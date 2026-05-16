@@ -89,15 +89,23 @@ def chains_in_module(mod) -> list:
 def load_module(name: str):
     """Import a discovered pipeline module by name (idempotent).
 
-    Imports the file by its discovered path (without polluting sys.path,
-    so a user module named ``tokenize.py`` won't shadow stdlib). Falls
-    back to a normal import if ``name`` wasn't discovered (e.g. already
-    on sys.path). Tags each discovered Pipeline / Chain with its source
-    path so the run-time git-snapshot has something to snapshot.
+    Imports the file by its discovered path. The containing directory is
+    appended (lowest priority) to ``sys.path`` so the pipeline module
+    can ``import`` its siblings — e.g. a ``ptyd_step.py`` that does
+    ``from srwl_uti_ptycho import …`` — without forcing users to turn
+    their pipeline folder into a package. Appending (rather than
+    inserting at the front) keeps stdlib precedence intact, so a user
+    module named ``tokenize.py`` still won't shadow stdlib's tokenize.
+
+    Falls back to a normal import if ``name`` wasn't discovered (e.g.
+    already on sys.path). Tags each discovered Pipeline / Chain with its
+    source path so the run-time git-snapshot has something to snapshot.
     """
     if name not in sys.modules:
         extra = DISCOVERED_PATHS.get(name)
         if extra:
+            if extra not in sys.path:
+                sys.path.append(extra)
             path = os.path.join(extra, name + '.py')
             spec = importlib.util.spec_from_file_location(name, path)
             if spec is None or spec.loader is None:

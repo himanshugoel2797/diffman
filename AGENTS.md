@@ -133,6 +133,17 @@ Downstream stages access upstream output via
 Each run records `chain`/`variation`/`upstream` in its `run.json` so
 chain progress is reconstructible from disk.
 
+A chain step can be targeted individually via
+`CHAIN.variations[v].run(rr, step='recon')` (or `step=2` /
+`step='2'`). The targeted step runs normally; upstream steps are
+re-entered with `assume_cached=True`, which raises if any of their
+stages aren't already cached. Downstream steps are skipped. This is
+how a single entry-point script can be invoked once per `srun`
+geometry — e.g., the forward sim under `-n 16 -N 4`, the reconstruction
+under `-n 4 -N 1` — without merging both into one launch. The
+canonical wiring reads `STEP` from the environment alongside
+`VARIATION`.
+
 Chains may declare `parent='other_chain'` to fork; the UI groups child
 chains under their parent and offers a source diff just like pipeline
 forks.
