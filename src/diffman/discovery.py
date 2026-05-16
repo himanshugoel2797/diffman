@@ -17,6 +17,9 @@ DISCOVERED_LIST: list[dict] = []           # ordered for UI listing
 # Keyed on the *pipeline name* (the string in `Pipeline('name', ...)`).
 PIPELINE_TO_MODULE: dict[str, str] = {}
 
+# Same idea for chains: chain name -> declaring module name.
+CHAIN_TO_MODULE: dict[str, str] = {}
+
 # Reverse lookup: module path -> module name. Used by the file-watcher
 # to know which module to evict when a .py changes.
 PATH_TO_MODULE: dict[str, str] = {}
@@ -28,7 +31,8 @@ _SKIP_MODULE_NAMES = {'diffman', 'core', 'cli', 'server',
 
 
 def discover(root: str = '.') -> list[dict]:
-    """Walk `root` for .py files mentioning both `diffman` and `PIPELINE`.
+    """Walk `root` for .py files mentioning `diffman` and either
+    `PIPELINE` or `CHAIN`.
 
     No code is executed. Returns and caches a sorted list of
     `{module, path, dir}` entries; populates `DISCOVERED_PATHS` so
@@ -47,7 +51,9 @@ def discover(root: str = '.') -> list[dict]:
                 text = Path(full).read_text(errors='ignore')
             except OSError:
                 continue
-            if 'diffman' not in text or 'PIPELINE' not in text:
+            if 'diffman' not in text:
+                continue
+            if 'PIPELINE' not in text and 'CHAIN' not in text:
                 continue
             mod = os.path.splitext(fn)[0]
             if mod in _SKIP_MODULE_NAMES:
@@ -69,14 +75,25 @@ def discover(root: str = '.') -> list[dict]:
     return found
 
 
+def chains_in_module(mod) -> list:
+    """Every Chain a module exposes — a single ``CHAIN`` plus any in
+    ``CHAINS = [...]``. Order: CHAIN first, then CHAINS in declaration
+    order."""
+    out = []
+    if getattr(mod, 'CHAIN', None) is not None:
+        out.append(mod.CHAIN)
+    out.extend(getattr(mod, 'CHAINS', None) or [])
+    return out
+
+
 def load_module(name: str):
     """Import a discovered pipeline module by name (idempotent).
 
     Imports the file by its discovered path (without polluting sys.path,
-    so a user module named `tokenize.py` won't shadow stdlib). Falls back
-    to a normal import if `name` wasn't discovered (e.g. it's already on
-    sys.path). Tags the module's `PIPELINE` with its source path so
-    `Pipeline.run()` can git-snapshot it.
+    so a user module named ``tokenize.py`` won't shadow stdlib). Falls
+    back to a normal import if ``name`` wasn't discovered (e.g. already
+    on sys.path). Tags each discovered Pipeline / Chain with its source
+    path so the run-time git-snapshot has something to snapshot.
     """
     if name not in sys.modules:
         extra = DISCOVERED_PATHS.get(name)
@@ -95,14 +112,16 @@ def load_module(name: str):
         else:
             importlib.import_module(name)
     mod = sys.modules[name]
+    src = getattr(mod, '__file__', None)
     pipe = getattr(mod, 'PIPELINE', None)
     if pipe is not None:
-        if getattr(pipe, '_source_file', None) is None:
-            try:
-                pipe._source_file = getattr(mod, '__file__', None)
-            except Exception:
-                pass
+        if pipe._source_file is None:
+            pipe._source_file = src
         PIPELINE_TO_MODULE[pipe.name] = name
+    for ch in chains_in_module(mod):
+        if ch._source_file is None:
+            ch._source_file = src
+        CHAIN_TO_MODULE[ch.name] = name
     return mod
 
 
@@ -110,13 +129,12 @@ def evict_module(name: str) -> None:
     """Drop cached state for `name` so the next `load_module` re-imports it.
 
     Used by the file watcher when a pipeline `.py` is edited. Removes
-    sys.modules entry, the pipeline-name reverse mapping, and any
-    variants attributed to this module in the global registry.
+    sys.modules entry, the pipeline- and chain-name reverse mappings,
+    and any variants attributed to this module in the global registry.
     """
-    import sys
     from .core import registry as _reg
     sys.modules.pop(name, None)
-    for pn, mn in list(PIPELINE_TO_MODULE.items()):
-        if mn == name:
-            del PIPELINE_TO_MODULE[pn]
+    for d in (PIPELINE_TO_MODULE, CHAIN_TO_MODULE):
+        for k in [k for k, v in d.items() if v == name]:
+            del d[k]
     _reg.drop_module(name)

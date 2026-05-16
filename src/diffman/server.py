@@ -23,6 +23,15 @@ Routes:
   GET  /api/render?path=<abs>                     → renderer payload for a file
   GET  /api/render_dataset?path=&dataset=         → h5 dataset preview
   GET  /api/srw_preview?path=<abs>&...            → SRW-aware heatmap + cuts
+  GET  /api/chains                                → chain fork forest
+  GET  /api/chain/{name}                          → chain metadata + variations
+  GET  /api/chain_progress/{name}/{variation}     → per-step status of a variation
+  GET  /api/chain_source_diff?chain=<name>        → diff vs parent chain .py
+  GET  /api/chain_variation_diff?chain=&variations=a,b  → per-step config diff
+  GET  /api/chain_diff?chain=<name>               → variation diff vs parent chain
+  GET  /api/scoreboard/{name}[?baseline=<var>]    → variation × metric table
+  GET  /api/run_diff?pipeline=&variant=&a=&b=     → explain why two runs differ
+  GET  /api/disk_usage                            → bytes per pipeline/variant/run
   GET  /artifact/{pipeline}/{variant}/{fp}/{rest} → raw file download
   WS   /ws                                        → push updates (run_changed)
 """
@@ -89,17 +98,52 @@ def diff_configs(parent: dict, child: dict, path: str = '') -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline-forest construction
+# Fork forest construction (shared by pipeline + chain endpoints)
 # ---------------------------------------------------------------------------
 
-def _pipeline_meta(module: str) -> dict:
-    """Import a discovered module and report its pipeline metadata."""
+def _build_forest(metas: list[dict], key: str) -> list[dict]:
+    """Group entries into a parent→children forest.
+
+    Entries without `key` (e.g. error metas in the pipeline forest) fall
+    out as roots without children. An entry whose `parent` doesn't match
+    any other entry's `key` is promoted to a root and tagged with
+    `orphan_parent`.
+    """
+    known = {m[key] for m in metas if key in m}
+    children: dict[Optional[str], list[dict]] = {}
+    for m in metas:
+        if key not in m:
+            children.setdefault(None, []).append(m)
+            continue
+        parent = m.get('parent')
+        if parent and parent not in known:
+            m = {**m, 'orphan_parent': parent}
+            parent = None
+        children.setdefault(parent, []).append(m)
+
+    sort_key = lambda x: x.get(key) or x.get('module') or ''
+    def _node(m):
+        kids = sorted(children.get(m[key], []), key=sort_key) if key in m else []
+        return {**m, 'children': [_node(c) for c in kids]}
+    return [_node(r) for r in sorted(children.get(None, []), key=sort_key)]
+
+
+# ---------------------------------------------------------------------------
+# Pipeline + chain metadata extractors
+# ---------------------------------------------------------------------------
+
+def _pipeline_meta(module: str) -> Optional[dict]:
+    """Import a module and return its pipeline metadata, or None if it
+    is chain-only (declares CHAIN/CHAINS but no PIPELINE) — chain-only
+    modules belong in /api/chains, not the pipeline forest."""
     try:
         mod = discovery.load_module(module)
     except Exception as e:
         return {'module': module, 'error': f'import failed: {e}'}
     pipe = getattr(mod, 'PIPELINE', None)
     if pipe is None:
+        if discovery.chains_in_module(mod):
+            return None
         return {'module': module, 'error': 'no PIPELINE attribute'}
     return {
         'module': module,
@@ -109,36 +153,106 @@ def _pipeline_meta(module: str) -> dict:
     }
 
 
-def _build_forest(metas: list[dict]) -> list[dict]:
-    """Group pipelines into roots → children by their `parent` declaration.
+def _chain_meta(chain) -> dict:
+    return {
+        'name': chain.name,
+        'module': discovery.CHAIN_TO_MODULE.get(chain.name),
+        'parent': chain.parent,
+        'step_count': len(chain.steps),
+        'variation_count': len(chain.variations),
+        'steps': [{'name': s.name, 'pipeline': s.pipeline.name,
+                   'consumes': list(s.consumes)} for s in chain.steps],
+    }
 
-    Matching is by pipeline name (the string in `Pipeline('name', ...)`).
-    Pipelines whose parent doesn't match anything in the scan are treated
-    as roots and flagged via `orphan_parent`.
+
+def _resolve_variation_runs(chain, variation, all_runs) -> dict:
+    """For each step in `chain`, locate the run that belongs to
+    `variation` by matching pipeline + variant + the upstream fingerprints
+    threaded through this variation. Returns ``{step_name: RunRecord}``
+    with ``None`` for steps with no matching run (pending, unresolved
+    upstream, or variation didn't specify the step).
+
+    This is the upstream-fp join shared by /api/chain_progress and
+    /api/scoreboard — both endpoints need to walk a variation's
+    expected chain and pin down the corresponding on-disk runs.
     """
-    known = {m['pipeline'] for m in metas if 'pipeline' in m}
-    children: dict[Optional[str], list[dict]] = {}
-    for m in metas:
-        if 'pipeline' not in m:
-            children.setdefault(None, []).append(m)
+    mapping = variation.resolve()
+    runs: dict = {s.name: None for s in chain.steps}
+    upstream_fps: dict = {}
+    for step in chain.steps:
+        variant_name = mapping.get(step.name)
+        if variant_name is None:
+            upstream_fps[step.name] = None
             continue
-        parent = m.get('parent')
-        if parent and parent not in known:
-            m = {**m, 'orphan_parent': parent}
-            parent = None
-        children.setdefault(parent, []).append(m)
+        required = {u: upstream_fps.get(u) for u in step.consumes}
+        if any(v is None for v in required.values()):
+            upstream_fps[step.name] = None
+            continue
+        for r in all_runs:
+            if (r.pipeline == step.pipeline.name
+                    and r.variant == variant_name
+                    and r.upstream == required):
+                runs[step.name] = r
+                upstream_fps[step.name] = r.fingerprint
+                break
+        else:
+            upstream_fps[step.name] = None
+    return runs
 
-    def _node(m):
-        key = lambda x: x.get('pipeline') or x['module']
-        #Only nodes with a pipeline name can have children. Error metas
-        #live under `children[None]` as roots, so without this guard
-        #_node(error_meta) would recurse into its sibling roots forever.
-        kids = (sorted(children.get(m['pipeline'], []), key=key)
-                if 'pipeline' in m else [])
-        return {**m, 'children': [_node(c) for c in kids]}
 
-    return [_node(r) for r in sorted(children.get(None, []),
-                                     key=lambda x: x.get('pipeline') or x['module'])]
+def _summarize_stage_status(stage_status: dict) -> str:
+    """Roll a stage_status dict up into a single chain-step status."""
+    statuses = set(stage_status.values())
+    if 'failed' in statuses:
+        return 'failed'
+    if statuses == {'cached'}:
+        return 'cached'
+    if statuses and statuses <= {'done', 'cached'}:
+        return 'done'
+    if not statuses:
+        return 'pending'
+    return 'mixed'
+
+
+def _load_stage_metrics(fdir: str):
+    """Yield ``(stage_name, metrics_dict)`` for each stage under `fdir`
+    that has a parseable metrics.json. Skips silently on missing or
+    malformed files — metrics are best-effort instrumentation."""
+    stages_dir = os.path.join(fdir, 'stages')
+    if not os.path.isdir(stages_dir):
+        return
+    for st_name in sorted(os.listdir(stages_dir)):
+        mp = os.path.join(stages_dir, st_name, 'metrics.json')
+        try:
+            data = json.loads(Path(mp).read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        if isinstance(data, dict):
+            yield st_name, data
+
+
+def _load_chain(name: str):
+    """Load a chain by name (importing its declaring module if necessary)."""
+    mod_name = discovery.CHAIN_TO_MODULE.get(name)
+    if mod_name is None:
+        #The name might not be indexed yet — sweep discovered modules.
+        for entry in discovery.DISCOVERED_LIST:
+            try:
+                discovery.load_module(entry['module'])
+            except Exception:
+                continue
+            if name in discovery.CHAIN_TO_MODULE:
+                mod_name = discovery.CHAIN_TO_MODULE[name]
+                break
+        if mod_name is None:
+            raise HTTPException(status_code=404,
+                                detail=f'chain {name!r} not found')
+    mod = discovery.load_module(mod_name)
+    for ch in discovery.chains_in_module(mod):
+        if ch.name == name:
+            return ch, mod_name
+    raise HTTPException(status_code=404,
+                        detail=f'chain {name!r} not in module {mod_name!r}')
 
 
 # ---------------------------------------------------------------------------
@@ -326,11 +440,12 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
     @app.get('/api/pipelines')
     def _pipelines():
         """Return the fork forest: roots → children, plus any orphans."""
-        metas = [_pipeline_meta(m['module'])
-                 for m in discovery.DISCOVERED_LIST]
+        metas = [m for m in (_pipeline_meta(d['module'])
+                             for d in discovery.DISCOVERED_LIST)
+                 if m is not None]
         return {
             'scan_root': os.path.abspath(app.state.scan_root),
-            'forest': _build_forest(metas),
+            'forest': _build_forest(metas, key='pipeline'),
         }
 
     # --- variants / describe --------------------------------------------
@@ -609,6 +724,280 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
             raise HTTPException(status_code=404, detail='one or both paths missing')
         return _compute_artifact_diff(path_a, path_b, target_max)
 
+    # --- chains ----------------------------------------------------------
+    @app.get('/api/chains')
+    def _chains():
+        """Return the chain fork forest, mirroring /api/pipelines.
+
+        Imports every discovered module so any CHAIN/CHAINS attribute is
+        indexed (chain discovery alone is grep-based and doesn't touch
+        the chain objects themselves).
+        """
+        chains = []
+        seen: set[str] = set()
+        for entry in discovery.DISCOVERED_LIST:
+            try:
+                mod = discovery.load_module(entry['module'])
+            except Exception:
+                continue
+            for ch in discovery.chains_in_module(mod):
+                if ch.name in seen:
+                    continue
+                seen.add(ch.name)
+                chains.append(_chain_meta(ch))
+        return {'forest': _build_forest(chains, key='name')}
+
+    @app.get('/api/chain/{name}')
+    def _chain_detail(name: str):
+        chain, _ = _load_chain(name)
+        variations = []
+        for v in chain.variations.values():
+            try:
+                mapping, err = v.resolve(), None
+            except Exception as e:
+                mapping, err = dict(v.overrides), str(e)
+            variations.append({'name': v.name, 'base': v.base,
+                               'forks_of': v.forks_of,
+                               'overrides': dict(v.overrides),
+                               'mapping': mapping, 'error': err})
+        return {**_chain_meta(chain), 'variations': variations}
+
+    @app.get('/api/chain_progress/{name}/{variation}')
+    def _chain_progress(name: str, variation: str):
+        """Per-step status of a chain variation, reconstructed from the
+        upstream provenance recorded in each run.json.
+
+        Each entry: `status` (done / cached / failed / pending / mixed /
+        unspecified), the run's short_fp + fingerprint when matched, and
+        per-stage statuses + errors for inline failed-step diagnostics.
+        """
+        chain, _ = _load_chain(name)
+        if variation not in chain.variations:
+            raise HTTPException(
+                status_code=404,
+                detail=f'variation {variation!r} not in chain {name!r}')
+        try:
+            mapping = chain.variations[variation].resolve()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        matched = _resolve_variation_runs(
+            chain, chain.variations[variation],
+            app.state.registry.list_runs())
+        steps = []
+        for step in chain.steps:
+            variant_name = mapping.get(step.name)
+            r = matched[step.name]
+            steps.append({
+                'name': step.name, 'pipeline': step.pipeline.name,
+                'variant': variant_name, 'consumes': list(step.consumes),
+                'status': ('unspecified' if variant_name is None
+                           else _summarize_stage_status(r.stage_status)
+                           if r is not None else 'pending'),
+                'short_fp': r.fingerprint[:12] if r else None,
+                'fingerprint': r.fingerprint if r else None,
+                'stage_status': dict(r.stage_status) if r else {},
+                'errors': dict(r.errors) if r else {},
+            })
+        return {'chain': name, 'variation': variation, 'steps': steps}
+
+    @app.get('/api/chain_source_diff')
+    def _chain_source_diff(chain: str):
+        """Unified text diff of this chain's .py against its parent chain's."""
+        import difflib
+        ch, _ = _load_chain(chain)
+        if not ch.parent:
+            return {'chain': chain, 'parent': None, 'diff': ''}
+        parent_ch, _ = _load_chain(ch.parent)
+        child_path = getattr(ch, '_source_file', None)
+        parent_path = getattr(parent_ch, '_source_file', None)
+        if not (child_path and parent_path):
+            raise HTTPException(status_code=404,
+                                detail='source file paths unavailable')
+        try:
+            child_src = Path(child_path).read_text().splitlines(keepends=True)
+            parent_src = Path(parent_path).read_text().splitlines(keepends=True)
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f'read failed: {e}')
+        unified = ''.join(difflib.unified_diff(
+            parent_src, child_src,
+            fromfile=os.path.basename(parent_path),
+            tofile=os.path.basename(child_path),
+            n=3))
+        return {'chain': chain, 'parent': ch.parent,
+                'parent_path': parent_path, 'child_path': child_path,
+                'diff': unified}
+
+    @app.get('/api/chain_diff')
+    def _chain_diff(chain: str):
+        """Match each variation in `chain` to its counterpart in the
+        parent chain (by `forks_of=` first, then by exact name) and
+        report which step→variant mappings differ.
+
+        Entries: 'matches' / 'differs' / 'only_in_child' / 'only_in_parent'.
+        Mirrors /api/diff's shape so the UI can render both with one
+        component.
+        """
+        ch, _ = _load_chain(chain)
+        if not ch.parent:
+            return {'chain': chain, 'parent': None,
+                    'variations': [{'variation': v.name,
+                                    'mapping': v.resolve(),
+                                    'kind': 'no_parent'}
+                                   for v in ch.variations.values()]}
+        parent_ch, _ = _load_chain(ch.parent)
+        child_names = set(ch.variations)
+        parent_names = set(parent_ch.variations)
+        #Build child→parent mapping, surfacing unresolved forks_of typos
+        #the way /api/diff does for variants.
+        c_to_p: dict[str, Optional[str]] = {}
+        unresolved: dict[str, str] = {}
+        for cn, cv in ch.variations.items():
+            if cv.forks_of:
+                if cv.forks_of in parent_names:
+                    c_to_p[cn] = cv.forks_of
+                else:
+                    c_to_p[cn] = None
+                    unresolved[cn] = cv.forks_of
+            elif cn in parent_names:
+                c_to_p[cn] = cn
+            else:
+                c_to_p[cn] = None
+        matched_parent = {p for p in c_to_p.values() if p}
+
+        out = []
+        for cn in sorted(child_names):
+            cv = ch.variations[cn]
+            try:
+                c_map = cv.resolve()
+            except Exception as e:
+                out.append({'variation': cn, 'kind': 'unresolved',
+                            'error': str(e)})
+                continue
+            entry: dict = {'variation': cn, 'mapping': c_map,
+                           'base': cv.base}
+            if cn in unresolved:
+                entry['forks_of_unresolved'] = unresolved[cn]
+            pn = c_to_p[cn]
+            if pn is None:
+                entry['kind'] = 'only_in_child'
+                out.append(entry); continue
+            try:
+                p_map = parent_ch.variations[pn].resolve()
+            except Exception:
+                p_map = dict(parent_ch.variations[pn].overrides)
+            entry['parent_variation'] = pn if pn != cn else None
+            step_diffs = [
+                {'step': step, 'parent': p_map.get(step),
+                 'child': c_map.get(step)}
+                for step in sorted(set(c_map) | set(p_map))
+                if c_map.get(step) != p_map.get(step)]
+            entry['kind'] = 'matches' if not step_diffs else 'differs'
+            entry['steps'] = step_diffs
+            out.append(entry)
+        for pn in sorted(parent_names - matched_parent):
+            out.append({'variation': pn, 'kind': 'only_in_parent'})
+        return {'chain': chain, 'parent': ch.parent, 'variations': out}
+
+    @app.get('/api/chain_variation_diff')
+    def _chain_variation_diff(chain: str, variations: str):
+        """N-way per-step parameter diff across variations of a chain.
+
+        Returns one section per step with the resolved variant name in
+        each variation and a flattened union-of-keys table over the
+        merged variant configs — same shape as /api/compare but rolled
+        up across the steps of the chain.
+        """
+        ch, _ = _load_chain(chain)
+        var_names = [v.strip() for v in variations.split(',') if v.strip()]
+        if len(var_names) < 2:
+            raise HTTPException(status_code=400,
+                                detail='need at least 2 variations to compare')
+        missing = [v for v in var_names if v not in ch.variations]
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail=f'variations not in chain: {missing}')
+        mappings = {v: ch.variations[v].resolve() for v in var_names}
+        sections = []
+        for step in ch.steps:
+            mod = step.pipeline._module
+            try:
+                discovery.load_module(mod) if mod else None
+            except Exception:
+                pass
+            columns = []
+            for vn in var_names:
+                variant_name = mappings[vn].get(step.name)
+                try:
+                    v = _global_registry.get(mod, variant_name)
+                    columns.append({'variation': vn,
+                                    'variant': variant_name,
+                                    'present': True,
+                                    'fingerprint': v.fingerprint,
+                                    'config': dict(v.config)})
+                except Exception as e:
+                    columns.append({'variation': vn,
+                                    'variant': variant_name,
+                                    'present': False,
+                                    'error': str(e),
+                                    'config': {}})
+            rows = _flatten_union([c['config'] if c['present'] else None
+                                   for c in columns])
+            sections.append({'step': step.name,
+                             'pipeline': step.pipeline.name,
+                             'columns': columns,
+                             'rows': rows})
+        return {'chain': chain, 'variations': var_names, 'steps': sections}
+
+    @app.get('/api/scoreboard/{name}')
+    def _scoreboard(name: str, baseline: Optional[str] = None):
+        """Cross-variation scoreboard. One row per chain variation, one
+        column per metric key (``<step>.<stage>.<name>``) written via
+        ``ctx.metric()``.
+
+        When `baseline=<variation>` is set, each row also carries a
+        `deltas` dict with ``value - baseline_value`` for numeric metrics
+        and ``None`` for non-numeric / missing-in-baseline keys.
+        """
+        chain, _ = _load_chain(name)
+        if baseline is not None and baseline not in chain.variations:
+            raise HTTPException(
+                status_code=404,
+                detail=f'baseline variation {baseline!r} not in chain {name!r}')
+        all_runs = app.state.registry.list_runs()
+        rows = []
+        all_metric_keys: set[str] = set()
+        for var_name, var in chain.variations.items():
+            try:
+                matched = _resolve_variation_runs(chain, var, all_runs)
+            except KeyError:
+                continue   #malformed variation (e.g. unresolved base=)
+            flat: dict = {}
+            for step in chain.steps:
+                run = matched[step.name]
+                if run is None:
+                    continue
+                for st_name, st_metrics in _load_stage_metrics(run.fdir):
+                    for k, v in st_metrics.items():
+                        key = f'{step.name}.{st_name}.{k}'
+                        flat[key] = v
+                        all_metric_keys.add(key)
+            rows.append({'variation': var_name, 'metrics': flat})
+
+        if baseline is not None:
+            base_row = next((r for r in rows if r['variation'] == baseline), {})
+            base_metrics = base_row.get('metrics', {})
+            for row in rows:
+                row['deltas'] = {
+                    k: (row['metrics'][k] - base_metrics[k]
+                        if isinstance(row['metrics'].get(k), (int, float))
+                        and isinstance(base_metrics.get(k), (int, float))
+                        else None)
+                    for k in row['metrics']}
+        return {'chain': name, 'baseline': baseline,
+                'metric_keys': sorted(all_metric_keys),
+                'rows': rows}
+
     # --- runs ------------------------------------------------------------
     def _summary(r):
         return {
@@ -637,6 +1026,99 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
             cfg = json.loads(Path(cfg_path).read_text())
         return {'run': match.__dict__, 'config': cfg,
                 'stages': _stage_summaries(match)}
+
+    @app.get('/api/disk_usage')
+    def _disk_usage():
+        """Bytes-on-disk rollup of the runs root, grouped by
+        (pipeline, variant, run). The UI uses this to decide what's safe
+        to clean. Pure observation — no deletion happens here.
+
+        Symlinks are followed for size attribution unless they loop or
+        break, in which case the broken/loop entry contributes 0 bytes.
+        """
+        root = app.state.registry.root
+        if not os.path.isdir(root):
+            return {'root': root, 'total': 0, 'pipelines': []}
+        pipelines = []
+        grand_total = 0
+        for pipeline in sorted(os.listdir(root)):
+            ppath = os.path.join(root, pipeline)
+            #_scripts/ holds the per-run git snapshot repo and isn't a
+            #pipeline directory; skip it. Anything else, even if its
+            #name starts with `_`, is a real pipeline.
+            if not os.path.isdir(ppath) or pipeline == '_scripts':
+                continue
+            variants = []
+            ptotal = 0
+            for variant in sorted(os.listdir(ppath)):
+                vpath = os.path.join(ppath, variant)
+                if not os.path.isdir(vpath):
+                    continue
+                runs = []
+                vtotal = 0
+                for short_fp in sorted(os.listdir(vpath)):
+                    rpath = os.path.join(vpath, short_fp)
+                    if not os.path.isdir(rpath):
+                        continue
+                    size = _du(rpath)
+                    runs.append({'short_fp': short_fp, 'size': size})
+                    vtotal += size
+                variants.append({'variant': variant, 'size': vtotal, 'runs': runs})
+                ptotal += vtotal
+            pipelines.append({'pipeline': pipeline, 'size': ptotal,
+                              'variants': variants})
+            grand_total += ptotal
+        return {'root': root, 'total': grand_total, 'pipelines': pipelines}
+
+    @app.get('/api/run_diff')
+    def _run_diff(pipeline: str, variant: str, a: str, b: str):
+        """Explain why two runs of the same (pipeline, variant) differ.
+
+        For each stage, report whether its cache key matches across runs.
+        For stages that differ, attribute the change to one or more of:
+        the function source, the config-keys slice, or any upstream
+        stage's key. Per-key config diffs are surfaced so the reader
+        can see *what* changed without re-running anything.
+        """
+        runs = app.state.registry.list_runs(pipeline=pipeline, variant=variant)
+        ra = next((r for r in runs if r.fingerprint.startswith(a)), None)
+        rb = next((r for r in runs if r.fingerprint.startswith(b)), None)
+        if ra is None or rb is None:
+            raise HTTPException(status_code=404,
+                                detail='one or both runs not found')
+        if ra.fingerprint == rb.fingerprint:
+            raise HTTPException(status_code=400,
+                                detail='cannot diff a run against itself')
+        stages = []
+        for st_name in sorted(set(ra.stage_keys) | set(rb.stage_keys)):
+            ka = ra.stage_keys.get(st_name)
+            kb = rb.stage_keys.get(st_name)
+            entry: dict = {'name': st_name, 'key_a': ka, 'key_b': kb,
+                           'identical': ka == kb}
+            if ka == kb:
+                stages.append(entry); continue
+            ma = _read_stage_meta(ra.fdir, st_name).get('components', {})
+            mb = _read_stage_meta(rb.fdir, st_name).get('components', {})
+            entry['fn_changed'] = ma.get('fn') != mb.get('fn')
+            entry['config_changed'] = ma.get('config') != mb.get('config')
+            entry['upstream_changed'] = ma.get('upstream') != mb.get('upstream')
+            entry['config_diff'] = diff_configs(
+                ma.get('config') or {}, mb.get('config') or {})
+            entry['upstream_diff'] = [
+                {'name': name, 'a': ma.get('upstream', {}).get(name),
+                 'b': mb.get('upstream', {}).get(name)}
+                for name in sorted(set((ma.get('upstream') or {}))
+                                   | set((mb.get('upstream') or {})))
+                if (ma.get('upstream') or {}).get(name)
+                   != (mb.get('upstream') or {}).get(name)
+            ]
+            stages.append(entry)
+        return {'pipeline': pipeline, 'variant': variant,
+                'run_a': {'fingerprint': ra.fingerprint,
+                          'short_fp': ra.fingerprint[:12]},
+                'run_b': {'fingerprint': rb.fingerprint,
+                          'short_fp': rb.fingerprint[:12]},
+                'stages': stages}
 
     @app.get('/api/stage/{pipeline}/{variant}/{short_fp}/{stage}')
     def _stage_detail(pipeline: str, variant: str, short_fp: str, stage: str):
@@ -749,6 +1231,31 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
     return app
 
 
+def _du(path: str) -> int:
+    """Bytes on disk under `path`, following symlinks to real files.
+
+    Loop or broken symlinks contribute 0 — they're surfaced rather than
+    crashing the whole walk. Used by /api/disk_usage; not a stable API.
+    """
+    total = 0
+    for root, _, files in os.walk(path, followlinks=False):
+        for f in files:
+            full = os.path.join(root, f)
+            try:
+                total += os.stat(full).st_size
+            except OSError:
+                continue
+    return total
+
+
+def _read_stage_meta(fdir: str, st_name: str) -> dict:
+    """Return _meta.json for a stage, or an empty dict if missing/bad."""
+    try:
+        return json.loads(Path(fdir, 'stages', st_name, '_meta.json').read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
 def _stage_summaries(record) -> list[dict]:
     out = []
     stages_dir = os.path.join(record.fdir, 'stages')
@@ -756,17 +1263,18 @@ def _stage_summaries(record) -> list[dict]:
         return out
     for st_name in sorted(os.listdir(stages_dir)):
         outs = os.path.join(stages_dir, st_name, 'outputs')
-        artifacts = []
-        if os.path.isdir(outs):
-            for root, _, files in os.walk(outs):
-                for fn in files:
-                    artifacts.append(os.path.relpath(
-                        os.path.join(root, fn), record.fdir))
+        artifacts = sum(len(fs) for _, _, fs in os.walk(outs)) \
+            if os.path.isdir(outs) else 0
+        meta = _read_stage_meta(record.fdir, st_name)
+        started, ended = meta.get('started'), meta.get('ended')
         out.append({
             'name': st_name,
             'status': record.stage_status.get(st_name),
             'key': record.stage_keys.get(st_name),
-            'artifact_count': len(artifacts),
+            'artifact_count': artifacts,
+            'started': started,
+            'ended': ended,
+            'duration_s': (ended - started) if (started and ended) else None,
         })
     return out
 
@@ -894,6 +1402,20 @@ def _array_diff(a, b, target_max: int, paths) -> dict:
         from . import srw_loaders
         delta_ds, _ = srw_loaders.downsample(d, target_max)
         meta['delta_heatmap'] = delta_ds.tolist()
+    elif d.ndim == 1:
+        #1-D arrays overlay much better than they summarize. Downsample
+        #to `target_max` so a 5e6-point trace doesn't ship megabytes of
+        #JSON; the x axis is the original index so the reader can spot
+        #where a divergence happens, not the decimated index.
+        n = a.size
+        stride = max(1, n // target_max)
+        idx = list(range(0, n, stride))
+        meta['overlay'] = {
+            'x':   idx,
+            'y_a': a[::stride].astype(float).tolist(),
+            'y_b': b[::stride].astype(float).tolist(),
+            'stride': stride,
+        }
     return meta
 
 

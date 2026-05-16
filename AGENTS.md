@@ -84,8 +84,9 @@ dm.register('jitter', base='base', probe=dict(jitter=True))
 
 def _stage_sim(ctx):
     cfg = ctx.variant.config
-    np.save(ctx.artifact('sim', 'out.npy'), …)
-    return {'out': ctx.artifact('sim', 'out.npy')}
+    tmp = '/tmp/out.npy'              # or wherever the tool wrote it
+    np.save(tmp, …)
+    ctx.artifact('sim', 'out.npy', tmp)   # symlink or copy into the run
 
 PIPELINE = dm.Pipeline('myname', [
     dm.Stage('sim', _stage_sim, config_keys=('scan', 'probe')),
@@ -107,6 +108,39 @@ PIPELINE = dm.Pipeline('myname_v2', [...], parent='myname')
 
 The UI will show `myname_v2` as a child of `myname` and report
 `scan.width` as the only difference on the `base` variant.
+
+### A chain of pipelines
+
+A `Chain` declares a DAG of pipelines plus `Variation`s — coherent
+tuples of (chain step -> variant name). Diffman doesn't execute; the
+chain just iterates its steps, threads upstream `RunRecord`s through,
+and lets the per-stage cache short-circuit unchanged work.
+
+```python
+import diffman as dm
+import forward_sim, ptyd_convert, recon
+
+CHAIN = dm.Chain('ptycho', steps=[
+    dm.ChainStep('forward_sim', forward_sim.PIPELINE),
+    dm.ChainStep('recon', recon.PIPELINE, consumes=('forward_sim',)),
+])
+CHAIN.variation('baseline',  forward_sim='base',   recon='ePIE')
+CHAIN.variation('jitter',    base='baseline', forward_sim='jitter')
+```
+
+Downstream stages access upstream output via
+`ctx.upstream_artifact('forward_sim', 'stages/sim/outputs/data.npy')`.
+Each run records `chain`/`variation`/`upstream` in its `run.json` so
+chain progress is reconstructible from disk.
+
+Chains may declare `parent='other_chain'` to fork; the UI groups child
+chains under their parent and offers a source diff just like pipeline
+forks.
+
+Stages can write scoreboard metrics via
+`ctx.metric('<stage>', '<name>', value)`. These persist to
+`stages/<stage>/metrics.json` and are aggregated across a chain's
+variations by the `/api/scoreboard/{chain}` endpoint.
 
 ### A new artifact renderer
 
