@@ -766,19 +766,25 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
         return {'query': q, 'variants': variants, 'runs': runs}
 
     @app.get('/api/artifact_diff')
-    def _artifact_diff(path_a: str, path_b: str, target_max: int = 256):
+    def _artifact_diff(path_a: str, path_b: str, target_max: int = 256,
+                       dataset: Optional[str] = None):
         """Numerical diff of two artifacts (.npy / .h5 / .json / text).
 
         For arrays: shapes, element-wise stats of (b - a), and a
         downsampled delta heatmap if 2-D. Different shapes → stats only.
-        For text/JSON: a unified text diff.
+        For text/JSON: a unified text diff. For .h5/.hdf5, pass
+        `dataset=<path>` to compare a specific dataset across both files
+        — the loaded array routes through the same array-diff path as
+        .npy. Whole-file h5 diffs aren't meaningful (heterogeneous
+        datasets in one container), so `dataset=` is required.
         """
         if not (_safe_under(path_a, app.state.registry.root) and
                 _safe_under(path_b, app.state.registry.root)):
             raise HTTPException(status_code=400, detail='path escape')
         if not (os.path.isfile(path_a) and os.path.isfile(path_b)):
             raise HTTPException(status_code=404, detail='one or both paths missing')
-        return _compute_artifact_diff(path_a, path_b, target_max)
+        return _compute_artifact_diff(path_a, path_b, target_max,
+                                      dataset=dataset)
 
     # --- chains ----------------------------------------------------------
     @app.get('/api/chains')
@@ -1347,7 +1353,8 @@ def _flatten_union(dicts: list[Optional[dict]]) -> list[dict]:
     return rows
 
 
-def _compute_artifact_diff(path_a: str, path_b: str, target_max: int) -> dict:
+def _compute_artifact_diff(path_a: str, path_b: str, target_max: int,
+                           dataset: Optional[str] = None) -> dict:
     """Numerical or textual diff of two artifacts."""
     import difflib
     ext = os.path.splitext(path_a)[1].lower()
@@ -1365,8 +1372,31 @@ def _compute_artifact_diff(path_a: str, path_b: str, target_max: int) -> dict:
         return _array_diff(a, b, target_max, paths=(path_a, path_b))
 
     if ext in ('.h5', '.hdf5'):
-        return {'kind': 'error',
-                'note': 'h5 diff: pass dataset= via render_dataset for now'}
+        if not dataset:
+            return {'kind': 'error',
+                    'note': 'h5 diff requires dataset=<path>; the file '
+                            'is a container of heterogeneous arrays.'}
+        try:
+            import h5py
+            import numpy as np
+        except ImportError as e:
+            return {'kind': 'error', 'note': f'{e.name} not available'}
+        try:
+            with h5py.File(path_a, 'r') as fa, h5py.File(path_b, 'r') as fb:
+                if dataset not in fa or dataset not in fb:
+                    where = ('both files' if dataset not in fa
+                             and dataset not in fb
+                             else 'path_a' if dataset not in fa
+                             else 'path_b')
+                    return {'kind': 'error',
+                            'note': f'dataset {dataset!r} missing in {where}'}
+                a = np.asarray(fa[dataset][...])
+                b = np.asarray(fb[dataset][...])
+        except OSError as e:
+            return {'kind': 'error', 'note': f'h5 read failed: {e}'}
+        out = _array_diff(a, b, target_max, paths=(path_a, path_b))
+        out['dataset'] = dataset
+        return out
 
     if ext in ('.json',):
         try:

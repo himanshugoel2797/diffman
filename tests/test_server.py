@@ -269,6 +269,94 @@ class TestArtifactDiff:
         assert r.status_code == 400
 
 
+class TestArtifactDiffH5:
+    """h5 diff routes a specific dataset through the npy array-diff path.
+
+    Whole-file h5 diff isn't meaningful (heterogeneous datasets in one
+    container), so the endpoint requires `dataset=<path>`.
+    """
+
+    def _stage_two_h5(self, scan_root, a_data, b_data, name='arr'):
+        h5py = pytest.importorskip('h5py')
+        runs = scan_root / 'runs'; runs.mkdir(exist_ok=True)
+        a = runs / 'a.h5'; b = runs / 'b.h5'
+        with h5py.File(a, 'w') as f:
+            f.create_dataset(name, data=a_data)
+        with h5py.File(b, 'w') as f:
+            f.create_dataset(name, data=b_data)
+        return a, b
+
+    def test_dataset_diff_returns_array_stats_and_heatmap(self, client):
+        c, scan_root = client
+        a, b = self._stage_two_h5(scan_root,
+                                  np.zeros((4, 5)), np.ones((4, 5)))
+        r = c.get(f'/api/artifact_diff?path_a={a}&path_b={b}'
+                  '&dataset=arr').json()
+        assert r['kind'] == 'array_diff'
+        assert r['dataset'] == 'arr'
+        assert r['stats']['abs_mean'] == 1.0
+        assert len(r['delta_heatmap']) == 4
+
+    def test_dataset_diff_returns_1d_overlay(self, client):
+        c, scan_root = client
+        a, b = self._stage_two_h5(scan_root,
+                                  np.linspace(0, 1, 32),
+                                  np.linspace(0, 1, 32) + 0.5)
+        r = c.get(f'/api/artifact_diff?path_a={a}&path_b={b}'
+                  '&dataset=arr').json()
+        assert r['dataset'] == 'arr'
+        assert r['overlay']['y_b'][0] - r['overlay']['y_a'][0] == 0.5
+
+    def test_dataset_diff_handles_nested_dataset_path(self, client):
+        c, scan_root = client
+        h5py = pytest.importorskip('h5py')
+        runs = scan_root / 'runs'; runs.mkdir(exist_ok=True)
+        a = runs / 'na.h5'; b = runs / 'nb.h5'
+        with h5py.File(a, 'w') as f:
+            f.create_dataset('grp/inner', data=np.arange(8, dtype=float))
+        with h5py.File(b, 'w') as f:
+            f.create_dataset('grp/inner', data=np.arange(8, dtype=float) + 1)
+        r = c.get(f'/api/artifact_diff?path_a={a}&path_b={b}'
+                  '&dataset=grp/inner').json()
+        assert r['kind'] == 'array_diff'
+        assert r['dataset'] == 'grp/inner'
+
+    def test_dataset_required_returns_error_payload(self, client):
+        c, scan_root = client
+        a, b = self._stage_two_h5(scan_root, np.zeros(4), np.ones(4))
+        r = c.get(f'/api/artifact_diff?path_a={a}&path_b={b}').json()
+        # No dataset= → 200 with an instructive error payload, matching
+        # the existing extension-mismatch error shape.
+        assert r['kind'] == 'error'
+        assert 'dataset' in r['note']
+
+    def test_missing_dataset_in_one_file_is_named(self, client):
+        c, scan_root = client
+        h5py = pytest.importorskip('h5py')
+        runs = scan_root / 'runs'; runs.mkdir(exist_ok=True)
+        a = runs / 'has.h5'; b = runs / 'lacks.h5'
+        with h5py.File(a, 'w') as f:
+            f.create_dataset('arr', data=np.zeros(3))
+        with h5py.File(b, 'w') as f:
+            f.create_dataset('other', data=np.zeros(3))
+        r = c.get(f'/api/artifact_diff?path_a={a}&path_b={b}'
+                  '&dataset=arr').json()
+        assert r['kind'] == 'error'
+        assert 'path_b' in r['note']
+
+    def test_mismatched_dataset_shapes_surfaces_via_array_diff(self, client):
+        c, scan_root = client
+        a, b = self._stage_two_h5(scan_root,
+                                  np.zeros((4, 5)), np.zeros((3, 5)))
+        r = c.get(f'/api/artifact_diff?path_a={a}&path_b={b}'
+                  '&dataset=arr').json()
+        # _array_diff records shapes and reports the mismatch without
+        # element-wise stats.
+        assert r['shape_a'] == [4, 5]
+        assert r['shape_b'] == [3, 5]
+        assert 'stats' not in r or r.get('stats') is None
+
+
 # ---------------------------------------------------------------------------
 # Feature: stage timings on /api/run
 # ---------------------------------------------------------------------------

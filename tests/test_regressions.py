@@ -262,21 +262,16 @@ def test_snapshot_failure_is_logged_at_least_once(scan_root, monkeypatch,
 
 
 # ---------------------------------------------------------------------------
-# srw_loaders.py: to_complex's fallback branch was unreachable because the
-# first reshape raised ValueError before `re is None` could be checked.
-# We can't import SRW here, so exercise the canonical and (ne, ny, nx, 2)
-# layouts by reproducing the same shape arithmetic.
+# srw_loaders.py: lock in the canonical (ny, nx, ne, 2) unpacking layout
+# that SRW's srwl_uti_save_wfr_hdf5 writes. An earlier audit tried to
+# detect an alternate (ne, ny, nx, 2) layout via except-ValueError on the
+# reshape, which was structurally unreachable (size-matched reshapes don't
+# raise) AND would silently re-axis-order data if it did. That defensive
+# fallback was removed; this test guards the canonical path against
+# future refactors that might break it.
 # ---------------------------------------------------------------------------
 
 def test_wfr_to_complex_unpacks_canonical_layout(scan_root, monkeypatch):
-    """Guard the canonical (ny, nx, ne, 2) unpacking path of `to_complex`.
-
-    Pre-fix, `to_complex` had a fallback branch for an alternate
-    (ne, ny, nx, 2) layout that was unreachable — the size check meant
-    the canonical reshape always succeeded. The fix restructures the
-    fallback so it can actually fire on alternate layouts. This test
-    locks in the canonical path so a future refactor doesn't break it.
-    """
     from diffman import srw_loaders
 
     ny, nx, ne = 3, 4, 2
