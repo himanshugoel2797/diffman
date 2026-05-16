@@ -253,11 +253,18 @@ class Pipeline:
     """An ordered list of Stages with optional fork-parent attribution."""
 
     def __init__(self, name: str, stages: list[Stage], *,
-                 parent: Optional[str] = None):
+                 parent: Optional[str] = None,
+                 module: Optional[str] = None):
         self.name = name
         self.stages = list(stages)
         self.parent = parent  # name of the pipeline this was forked from
         self._source_file: Optional[str] = None  # set by discovery.load_module
+        #Caller's __name__ — used by Chain to resolve variant names against
+        #the right module-scoped registry entry. Can be overridden for tests.
+        if module is None:
+            caller = inspect.currentframe().f_back
+            module = caller.f_globals.get('__name__') if caller else None
+        self._module = module
         self._validate()
 
     def _validate(self):
@@ -272,17 +279,25 @@ class Pipeline:
 
     def run(self, variant: Variant, registry: 'RunRegistry', *,
             force: Optional[set] = None,
-            only: Optional[set] = None) -> 'RunRecord':
+            only: Optional[set] = None,
+            upstream: Optional[dict] = None,
+            chain: Optional[str] = None,
+            variation: Optional[str] = None) -> 'RunRecord':
         force = set(force or ())
         only = set(only) if only else None
-        ctx = registry.open_run(self.name, variant)
+        upstream = dict(upstream or {})
+        ctx = registry.open_run(self.name, variant,
+                                upstream=upstream,
+                                chain=chain,
+                                variation=variation)
         upstream_keys: dict[str, str] = {}
 
         if self._source_file:
             try:
                 from .git_backup import snapshot
                 snapshot(registry.root, self._source_file,
-                         f'run {self.name}/{variant.name}/{variant.short_fp}')
+                         f'run {self.name}/{variant.name}/'
+                         f'{ctx.record.fingerprint[:12]}')
             except Exception as e:
                 global _snapshot_warned
                 if not _snapshot_warned:
@@ -343,6 +358,137 @@ class Pipeline:
 
 
 # ---------------------------------------------------------------------------
+# Chains
+# ---------------------------------------------------------------------------
+
+def _run_fingerprint(variant: Variant, upstream: dict) -> str:
+    """Per-run fingerprint folding in the variant config and any upstream
+    run fingerprints. Equals ``variant.fingerprint`` when there's no
+    upstream, so plain (un-chained) runs keep their existing directory
+    layout."""
+    if not upstream:
+        return variant.fingerprint
+    return fingerprint({
+        'variant': variant.fingerprint,
+        'upstream': {name: rec.fingerprint
+                     for name, rec in sorted(upstream.items())},
+    })
+
+
+@dataclass
+class ChainStep:
+    """A node in a Chain: a pipeline plus the names of earlier steps whose
+    runs this step consumes as input. `consumes` may point to any prior
+    step, not only the immediate predecessor, so chains are DAGs not just
+    sequences (analysis can read both `recon` and `forward_sim`, etc.).
+    """
+    name: str
+    pipeline: 'Pipeline'
+    consumes: tuple = ()
+
+    def __post_init__(self):
+        self.consumes = tuple(self.consumes)
+
+
+class Variation:
+    """A named tuple of (chain step -> variant name) — picks one variant per
+    step in the chain. `base=` inherits another variation's mapping; any
+    keyword overrides replace individual entries. Two variations that
+    happen to share a step's variant choice also share the corresponding
+    run directory on disk (fingerprint caching).
+    """
+
+    __slots__ = ('chain', 'name', 'base', 'overrides')
+
+    def __init__(self, chain: 'Chain', name: str, *,
+                 base: Optional[str] = None, **mapping):
+        self.chain = chain
+        self.name = name
+        self.base = base
+        self.overrides = mapping
+
+    def resolve(self) -> dict:
+        if self.base is None:
+            return dict(self.overrides)
+        if self.base not in self.chain.variations:
+            raise KeyError(
+                f'variation base {self.base!r} not found in '
+                f'chain {self.chain.name!r}')
+        out = self.chain.variations[self.base].resolve()
+        out.update(self.overrides)
+        return out
+
+    def run(self, run_registry: 'RunRegistry') -> dict:
+        return self.chain._run(self, run_registry)
+
+
+class Chain:
+    """A declarative DAG of Pipelines linked by upstream/downstream edges.
+
+    Chains observe, they don't execute: ``Chain.variations[name].run(rr)``
+    iterates the steps in order, looks up each step's variant from the
+    variation's mapping, and calls the existing ``Pipeline.run`` with the
+    upstream `RunRecord`s threaded through. The pipeline's per-stage
+    cache plus upstream-aware run fingerprints make re-invocation
+    idempotent — re-running a variation after editing only the analysis
+    code re-executes only those stages whose function source changed.
+    """
+
+    def __init__(self, name: str, steps: list[ChainStep]):
+        self.name = name
+        self.steps = list(steps)
+        self.variations: dict[str, Variation] = {}
+        self._source_file: Optional[str] = None
+        self._validate()
+
+    def _validate(self):
+        seen: set[str] = set()
+        for s in self.steps:
+            if s.name in seen:
+                raise ValueError(f'duplicate chain step {s.name!r}')
+            for u in s.consumes:
+                if u not in seen:
+                    raise ValueError(
+                        f'chain step {s.name!r} consumes {u!r} '
+                        f'which is not an earlier step')
+            seen.add(s.name)
+
+    def variation(self, name: str, *, base: Optional[str] = None,
+                  **mapping) -> Variation:
+        if name in self.variations:
+            raise ValueError(
+                f'variation {name!r} already defined in chain {self.name!r}')
+        v = Variation(self, name, base=base, **mapping)
+        self.variations[name] = v
+        return v
+
+    def _run(self, variation: Variation, rr: 'RunRegistry') -> dict:
+        mapping = variation.resolve()
+        runs: dict[str, RunRecord] = {}
+        for step in self.steps:
+            if step.name not in mapping:
+                raise KeyError(
+                    f'variation {variation.name!r} does not specify '
+                    f'a variant for step {step.name!r}')
+            variant_name = mapping[step.name]
+            module = step.pipeline._module
+            if module is None:
+                raise RuntimeError(
+                    f'pipeline {step.pipeline.name!r} has no module '
+                    f'attribution; cannot resolve variant '
+                    f'{variant_name!r} from the registry')
+            variant = registry.get(module, variant_name)
+            upstream = {u: runs[u] for u in step.consumes}
+            record = step.pipeline.run(
+                variant, rr,
+                upstream=upstream,
+                chain=self.name,
+                variation=variation.name)
+            runs[step.name] = record
+        return runs
+
+
+# ---------------------------------------------------------------------------
 # Run registry
 # ---------------------------------------------------------------------------
 
@@ -359,13 +505,34 @@ class RunRecord:
     errors: dict = field(default_factory=dict)
     git_rev: Optional[str] = None
     host: Optional[str] = None
+    #Chain provenance. `chain`/`variation` name the chain context this run
+    #was executed under (if any). `upstream` maps consumed step name ->
+    #upstream run's fingerprint, the same value used to derive this run's
+    #own fingerprint, so chain progress is reconstructible from run.json
+    #alone without a separate state file.
+    chain: Optional[str] = None
+    variation: Optional[str] = None
+    upstream: dict = field(default_factory=dict)
 
 
 class RunContext:
-    def __init__(self, fdir: str, variant: Variant, record: RunRecord):
+    def __init__(self, fdir: str, variant: Variant, record: RunRecord,
+                 upstream: Optional[dict] = None):
         self.fdir = fdir
         self.variant = variant
         self.record = record
+        #Mapping {chain_step_name: RunRecord} so stages can read upstream
+        #artifacts during chain execution. Empty for un-chained runs.
+        self.upstream: dict = dict(upstream or {})
+
+    def upstream_artifact(self, step_name: str, relpath: str = '') -> str:
+        """Path to an upstream run's directory (or an artifact within it).
+
+        Example: ``ctx.upstream_artifact('forward_sim',
+        'stages/sim/outputs/data.npy')``.
+        """
+        rec = self.upstream[step_name]
+        return os.path.join(rec.fdir, relpath) if relpath else rec.fdir
 
     def stage_dir(self, stage_name: str) -> str:
         d = os.path.join(self.fdir, 'stages', stage_name)
@@ -421,19 +588,27 @@ class RunRegistry:
     def invalidate(self) -> None:
         self._cache = None
 
-    def open_run(self, pipeline: str, variant: Variant) -> RunContext:
-        fdir = os.path.join(self.root, pipeline, variant.name, variant.short_fp)
+    def open_run(self, pipeline: str, variant: Variant, *,
+                 upstream: Optional[dict] = None,
+                 chain: Optional[str] = None,
+                 variation: Optional[str] = None) -> RunContext:
+        upstream = dict(upstream or {})
+        run_fp = _run_fingerprint(variant, upstream)
+        fdir = os.path.join(self.root, pipeline, variant.name, run_fp[:12])
         os.makedirs(fdir, exist_ok=True)
         record = RunRecord(
             pipeline=pipeline,
             variant=variant.name,
-            fingerprint=variant.fingerprint,
+            fingerprint=run_fp,
             fdir=fdir,
             started=_now(),
             git_rev=_git_rev(),
             host=socket.gethostname(),
+            chain=chain,
+            variation=variation,
+            upstream={name: rec.fingerprint for name, rec in upstream.items()},
         )
-        ctx = RunContext(fdir, variant, record)
+        ctx = RunContext(fdir, variant, record, upstream=upstream)
         self._flush(record)
         with open(os.path.join(fdir, 'config.json'), 'w') as f:
             json.dump(_to_plain(variant.config), f, indent=2, default=str)

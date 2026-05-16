@@ -133,6 +133,68 @@ rr = dm.RunRegistry(root='runs')
 mysim_v2.PIPELINE.run(dm.registry.get('mysim_v2', 'jitter'), rr)
 ```
 
+## Chaining pipelines
+
+A `Chain` declares a DAG of pipelines and the upstream/downstream
+edges between them. A `Variation` picks a coherent tuple of variants
+across the chain — one per step — so `baseline`, `jitter_low`,
+`algo_dm` etc. each refer to a consistent slice through the chain.
+Diffman doesn't execute the chain; calling
+`chain.variations[name].run(rr)` loops over the steps and threads each
+upstream `RunRecord` into the next pipeline's `.run()`. Per-stage
+caching plus upstream-aware run fingerprints make re-invocation
+idempotent: shared upstream variants reuse the same run directory,
+and downstream runs invalidate automatically when their upstream
+changes.
+
+```python
+# chains/ptycho.py
+import diffman as dm
+import forward_sim, ptyd_convert, recon, analysis
+
+CHAIN = dm.Chain('ptycho', steps=[
+    dm.ChainStep('forward_sim',  forward_sim.PIPELINE),
+    dm.ChainStep('ptyd_convert', ptyd_convert.PIPELINE,
+                 consumes=('forward_sim',)),
+    dm.ChainStep('recon',        recon.PIPELINE,
+                 consumes=('ptyd_convert',)),
+    dm.ChainStep('analysis',     analysis.PIPELINE,
+                 consumes=('recon', 'forward_sim')),   # FRC needs both
+])
+
+CHAIN.variation('baseline',
+    forward_sim='base', ptyd_convert='default',
+    recon='ePIE', analysis='standard')
+CHAIN.variation('jitter_low',  base='baseline', forward_sim='jitter_low')
+CHAIN.variation('jitter_high', base='jitter_low', forward_sim='jitter_high')
+CHAIN.variation('algo_dm',     base='baseline', recon='DM')
+```
+
+```python
+# run_ablation.py
+import diffman as dm
+from chains.ptycho import CHAIN
+
+rr = dm.RunRegistry('runs')
+for name in ['baseline', 'jitter_low', 'jitter_high', 'algo_dm']:
+    CHAIN.variations[name].run(rr)
+```
+
+Downstream stages read upstream artifacts via the run context:
+
+```python
+def _frc(ctx):
+    recon_path = ctx.upstream_artifact('recon',
+                                       'stages/recon/outputs/result.npy')
+    truth_path = ctx.upstream_artifact('forward_sim',
+                                       'stages/sim/outputs/field.npy')
+    # ...
+```
+
+Each run's `run.json` records `chain`, `variation`, and
+`upstream={step: fingerprint}` — chain progress is reconstructible
+from those edges alone, no separate state file.
+
 ## Web UI
 
 `diffman serve --root runs --scan-root .` starts the read-only viewer.

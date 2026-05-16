@@ -6,6 +6,9 @@ from .core import (
     VariantRegistry,
     Stage,
     Pipeline,
+    Chain,
+    ChainStep,
+    Variation,
     RunRegistry,
     RunContext,
     RunRecord,
@@ -18,6 +21,7 @@ from .discovery import discover, load_module
 __all__ = [
     'Config', 'Variant', 'VariantRegistry',
     'Stage', 'Pipeline',
+    'Chain', 'ChainStep', 'Variation',
     'RunRegistry', 'RunContext', 'RunRecord',
     'fingerprint', 'register', 'registry',
     'discover', 'load_module',

@@ -110,6 +110,30 @@ PIPELINE = dm.Pipeline('myname_v2', [...], parent='myname')
 The UI will show `myname_v2` as a child of `myname` and report
 `scan.width` as the only difference on the `base` variant.
 
+### A chain of pipelines
+
+A `Chain` declares a DAG of pipelines plus `Variation`s — coherent
+tuples of (chain step -> variant name). Diffman doesn't execute; the
+chain just iterates its steps, threads upstream `RunRecord`s through,
+and lets the per-stage cache short-circuit unchanged work.
+
+```python
+import diffman as dm
+import forward_sim, ptyd_convert, recon
+
+CHAIN = dm.Chain('ptycho', steps=[
+    dm.ChainStep('forward_sim', forward_sim.PIPELINE),
+    dm.ChainStep('recon', recon.PIPELINE, consumes=('forward_sim',)),
+])
+CHAIN.variation('baseline',  forward_sim='base',   recon='ePIE')
+CHAIN.variation('jitter',    base='baseline', forward_sim='jitter')
+```
+
+Downstream stages access upstream output via
+`ctx.upstream_artifact('forward_sim', 'stages/sim/outputs/data.npy')`.
+Each run records `chain`/`variation`/`upstream` in its `run.json` so
+chain progress is reconstructible from disk.
+
 ### A new artifact renderer
 
 Extend `renderers.render()` in
