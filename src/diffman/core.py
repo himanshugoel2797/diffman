@@ -43,20 +43,23 @@ def _caller_module() -> Optional[str]:
     return inspect.currentframe().f_back.f_back.f_globals.get('__name__')
 
 
-def _try_snapshot(root: str, source_file: str, message: str,
-                  _warned: list = [False]) -> None:
+_SNAPSHOT_WARNED = False
+
+
+def _try_snapshot(root: str, source_file: str, message: str) -> None:
     """Best-effort git snapshot of a pipeline / chain source file.
 
     Failures (no git, no write perms) are logged once and then silently
     swallowed — snapshotting is a nice-to-have for traceability, never
     a blocker for the actual run.
     """
+    global _SNAPSHOT_WARNED
     try:
         from .git_backup import snapshot
         snapshot(root, source_file, message)
     except Exception as e:
-        if not _warned[0]:
-            _warned[0] = True
+        if not _SNAPSHOT_WARNED:
+            _SNAPSHOT_WARNED = True
             _log.warning('git_backup.snapshot failed (further failures '
                          'will be silent): %s', e)
 
@@ -268,10 +271,6 @@ class Stage:
             'config': dict(cfg),
             'upstream': {k: upstream_keys[k] for k in self.inputs},
         }
-
-    def key(self, variant: Variant, upstream_keys: dict) -> str:
-        return fingerprint({'stage': self.name,
-                            **self.key_components(variant, upstream_keys)})
 
 
 class Pipeline:

@@ -248,9 +248,9 @@ def test_snapshot_failure_is_logged_at_least_once(scan_root, monkeypatch,
 
     import diffman.git_backup as gb
     monkeypatch.setattr(gb, 'snapshot', boom)
-    #_try_snapshot uses a mutable default for its "already warned" flag;
-    #monkeypatch a fresh list so the warning fires for THIS test.
-    monkeypatch.setattr(core._try_snapshot, '__defaults__', ([False],))
+    #Reset the "already warned" flag so the warning fires for THIS test
+    #even if a previous one tripped it.
+    monkeypatch.setattr(core, '_SNAPSHOT_WARNED', False)
 
     v = core.registry.register('only', module='_diffman_test_snap', x=1)
     pipe = core.Pipeline('_pipe_snap', [core.Stage('sim', lambda ctx: None)])
@@ -402,6 +402,34 @@ def test_artifact_route_blocks_dot_dot_traversal_in_url(scan_root):
         r1 = c.get('/artifact/p/v/fp/..%2F..%2Fsecret.txt')
         assert r1.status_code in (400, 404)
         assert 'TOP_SECRET' not in r1.text
+
+
+# ---------------------------------------------------------------------------
+# discovery.py: a partial import that registers a variant and then raises
+# left the variant in the global registry. The retry would then trip the
+# `variant 'X' already registered` guard, masking the real import error.
+# ---------------------------------------------------------------------------
+
+def test_load_module_rolls_back_variants_on_import_failure(scan_root):
+    from diffman import discovery
+    from diffman.core import registry
+
+    path = scan_root / '_diffman_partial.py'
+    path.write_text(
+        "import diffman as dm\n"
+        "dm.register('a', x=1)\n"
+        "raise RuntimeError('boom')\n"
+    )
+    discovery.discover(str(scan_root))
+
+    with pytest.raises(RuntimeError, match='boom'):
+        discovery.load_module('_diffman_partial')
+    # Variant 'a' must NOT remain in the registry — otherwise the retry
+    # below would fail with 'already registered' instead of 'boom'.
+    assert registry.for_module('_diffman_partial') == []
+    # Retry should produce the original error again, not a stale-state one.
+    with pytest.raises(RuntimeError, match='boom'):
+        discovery.load_module('_diffman_partial')
 
 
 def test_api_compare_handles_failed_module(scan_root, make_pipeline):

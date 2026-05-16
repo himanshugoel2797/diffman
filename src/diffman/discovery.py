@@ -107,10 +107,16 @@ def load_module(name: str):
             try:
                 spec.loader.exec_module(module)
             except Exception:
-                sys.modules.pop(name, None)
+                #Roll back variants/indices registered before the failure
+                #so a retry doesn't trip the "already registered" guard.
+                evict_module(name)
                 raise
         else:
-            importlib.import_module(name)
+            try:
+                importlib.import_module(name)
+            except Exception:
+                evict_module(name)
+                raise
     mod = sys.modules[name]
     src = getattr(mod, '__file__', None)
     pipe = getattr(mod, 'PIPELINE', None)

@@ -959,3 +959,147 @@ class TestUnifiedFileDiff:
         with pytest.raises(HTTPException) as ei:
             _unified_file_diff(None, str(tmp_path / 'c.py'))
         assert ei.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# /api/source_diff: pipeline-level unified diff vs parent
+# ---------------------------------------------------------------------------
+
+class TestSourceDiffEndpoint:
+    def test_returns_unified_diff_against_parent_pipeline(self, client):
+        c, _ = client
+        d = c.get('/api/source_diff?module=_diffman_test_b').json()
+        assert d['parent_module'] == '_diffman_test_a'
+        # The child differs from the parent at minimum in `width` and
+        # `parent=` declaration — both should appear in the diff.
+        assert '-' in d['diff'] and '+' in d['diff']
+
+    def test_returns_empty_diff_for_root_module(self, client):
+        c, _ = client
+        d = c.get('/api/source_diff?module=_diffman_test_a').json()
+        assert d['parent_module'] is None
+        assert d['diff'] == ''
+
+
+# ---------------------------------------------------------------------------
+# /api/render_dataset routing + path-escape guard
+# ---------------------------------------------------------------------------
+
+class TestRenderDatasetEndpoint:
+    def test_returns_dataset_payload(self, scan_root, make_pipeline):
+        h5py = pytest.importorskip('h5py')
+        runs = scan_root / 'runs'; runs.mkdir(exist_ok=True)
+        p = runs / 'a.h5'
+        with h5py.File(p, 'w') as f:
+            f.create_dataset('arr', data=np.linspace(0, 1, 10))
+        app = create_app(root=str(runs), scan_root=str(scan_root),
+                         no_scan=True)
+        with TestClient(app) as c:
+            r = c.get(f'/api/render_dataset?path={p}&dataset=arr').json()
+        assert r['kind'] == 'plot_1d'
+        assert len(r['data']['y']) == 10
+
+    def test_rejects_path_escape(self, scan_root):
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=True)
+        with TestClient(app) as c:
+            r = c.get('/api/render_dataset?path=/etc/passwd&dataset=x')
+        assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# /api/srw_preview: routes through srw_loaders with a faked SRW + path guard
+# ---------------------------------------------------------------------------
+
+class TestSrwPreviewEndpoint:
+    def test_path_escape_rejected(self, scan_root):
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=True)
+        with TestClient(app) as c:
+            r = c.get('/api/srw_preview?path=/etc/passwd')
+        assert r.status_code == 400
+
+    def test_returns_error_when_srw_unavailable(self, scan_root):
+        from diffman import srw_loaders
+        runs = scan_root / 'runs'; runs.mkdir(exist_ok=True)
+        # An empty .h5 path under runs that satisfies _safe_under; the
+        # loader will fail (no h5py readable or SRW unavailable in CI).
+        target = runs / 'fake.h5'; target.write_bytes(b'')
+        app = create_app(root=str(runs), scan_root=str(scan_root),
+                         no_scan=True)
+        # Force srwlib to be reported missing so the loader path returns
+        # a clean error payload without trying to import srwpy.
+        from diffman import srw_loaders as sl
+        old = sl._srwlib
+        sl._srwlib = lambda: None
+        try:
+            with TestClient(app) as c:
+                r = c.get(f'/api/srw_preview?path={target}')
+        finally:
+            sl._srwlib = old
+        assert r.status_code == 200
+        body = r.json()
+        assert body['kind'] == 'error'
+
+
+# ---------------------------------------------------------------------------
+# /api/disk_usage: broken-symlink branch of _du contributes 0 without crash
+# ---------------------------------------------------------------------------
+
+class TestDiskUsageBrokenSymlink:
+    def test_broken_symlink_in_run_dir_does_not_crash(self, scan_root):
+        # Hand-build a minimal run dir with one valid file + one broken
+        # symlink. _du must skip the broken link rather than raise OSError.
+        rdir = scan_root / 'runs' / 'p' / 'v' / 'abcabcabcabc'
+        outs = rdir / 'stages' / 's' / 'outputs'
+        outs.mkdir(parents=True)
+        (outs / 'real.bin').write_bytes(b'x' * 100)
+        (outs / 'dangling').symlink_to(str(scan_root / 'this_path_is_missing'))
+        (rdir / 'run.json').write_text(json.dumps({
+            'pipeline': 'p', 'variant': 'v',
+            'fingerprint': 'abcabcabcabc' + '0'*52, 'fdir': str(rdir),
+            'started': 't', 'stage_keys': {}, 'stage_status': {}, 'errors': {},
+        }))
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=True)
+        with TestClient(app) as c:
+            d = c.get('/api/disk_usage').json()
+        pipes = {p['pipeline']: p for p in d['pipelines']}
+        # Real file contributes its 100 bytes, broken symlink contributes 0.
+        assert pipes['p']['size'] >= 100
+
+
+# ---------------------------------------------------------------------------
+# /artifact/: pipeline-component path escape via the URL itself
+# ---------------------------------------------------------------------------
+
+class TestArtifactRoutePathComponentEscape:
+    def test_dotdot_in_pipeline_component_is_rejected(self, scan_root):
+        """A `..` segment as the {pipeline} URL parameter must not be
+        able to climb above runs_root. The textual normpath collapses it
+        before the prefix check fires."""
+        secret = scan_root / 'top_secret.txt'
+        secret.write_text('UNAUTHORIZED')
+        runs = scan_root / 'runs'; runs.mkdir(exist_ok=True)
+        app = create_app(root=str(runs), scan_root=str(scan_root),
+                         no_scan=True)
+        with TestClient(app) as c:
+            # Either FastAPI normalizes during routing (404) or our
+            # explicit check fires (400). The file must not be returned.
+            r = c.get('/artifact/..%2F../v/fp/top_secret.txt')
+        assert r.status_code in (400, 404)
+        assert 'UNAUTHORIZED' not in r.text
+
+
+# ---------------------------------------------------------------------------
+# /api/find query length validation
+# ---------------------------------------------------------------------------
+
+class TestFindEdgeCases:
+    def test_query_shorter_than_4_chars_returns_400(self, scan_root):
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=True)
+        with TestClient(app) as c:
+            assert c.get('/api/find?q=ab').status_code == 400
+            # Empty also rejected (the strip() makes it shorter than 4).
+            assert c.get('/api/find?q=%20%20%20').status_code == 400
