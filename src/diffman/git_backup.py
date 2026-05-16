@@ -5,9 +5,12 @@ Maintains <runs_root>/_scripts/.git/ with one commit per Pipeline.run().
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
+
+_log = logging.getLogger(__name__)
 
 
 def snapshot(runs_root: str, source_file: str, message: str) -> None:
@@ -29,7 +32,8 @@ def snapshot(runs_root: str, source_file: str, message: str) -> None:
         try:
             subprocess.run(['git', 'init', '-q'], cwd=repo, check=True,
                            env=env, stderr=subprocess.DEVNULL)
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as e:
+            _log.warning('git_backup: git init failed in %s: %s', repo, e)
             return
     dst = os.path.join(repo, os.path.basename(source_file))
     try:
@@ -41,5 +45,6 @@ def snapshot(runs_root: str, source_file: str, message: str) -> None:
                        cwd=repo, check=False, env=env,
                        stderr=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL)
-    except Exception:
-        pass
+    except Exception as e:
+        _log.warning('git_backup: snapshot of %s failed: %s', source_file, e)
+        raise

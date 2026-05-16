@@ -122,7 +122,7 @@ def _render_npy(path, meta):
     if not _HAS_NUMPY:
         return {'kind': 'binary', 'data': None,
                 'meta': {**meta, 'note': 'numpy not installed'}}
-    arr = np.load(path, mmap_mode='r')
+    arr = np.load(path, mmap_mode='r', allow_pickle=False)
     return _array_payload(arr, meta)
 
 
@@ -147,7 +147,7 @@ def _render_h5(path, meta):
 
 def render_h5_dataset(path: str, dataset: str, *,
                       max_points: int = 200_000) -> dict:
-    """Render a specific HDF5 dataset (or .npy treated as one dataset)."""
+    """Render a specific HDF5 dataset."""
     if not _HAS_H5PY:
         return {'kind': 'error', 'data': 'h5py not installed',
                 'meta': {'path': path, 'dataset': dataset}}
@@ -186,10 +186,16 @@ def _array_payload(arr, meta: dict) -> dict:
     a = np.asarray(arr)
     meta = {**meta, 'shape': list(a.shape), 'dtype': str(a.dtype)}
     if a.ndim == 1:
-        x = list(range(a.size))
-        y = a.tolist() if a.size <= 10_000 else a[::int(np.ceil(a.size / 10_000))].tolist()
-        return {'kind': 'plot_1d', 'data': {'x': x[:len(y)], 'y': y},
-                'meta': meta}
+        if a.size <= 10_000:
+            stride = 1
+            y = a.tolist()
+        else:
+            stride = int(np.ceil(a.size / 10_000))
+            y = a[::stride].tolist()
+        x = list(range(0, stride * len(y), stride))
+        if stride != 1:
+            meta['decimated_stride'] = stride
+        return {'kind': 'plot_1d', 'data': {'x': x, 'y': y}, 'meta': meta}
     if a.ndim == 2:
         target_max = 512
         if max(a.shape) > target_max:

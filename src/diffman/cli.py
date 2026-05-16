@@ -44,7 +44,7 @@ def _cmd_describe(args):
         'name': v.name,
         'module': v.module,
         'fingerprint': v.fingerprint,
-        'config': v.config.merged(),
+        'config': dict(v.config),
     }, indent=2, default=str))
     return 0
 

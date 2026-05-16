@@ -193,17 +193,22 @@ def _load_wfr_hdf5(path, srw):
 
     arEx = np.asarray(wfr.arEx, dtype=np.float32)
     arEy = np.asarray(wfr.arEy, dtype=np.float32)
-    #SRW interleaves real/imag along the fastest-varying axis. Layout is
-    #(ny, nx, ne, 2). We collapse over energy by summing |E|² when ne > 1.
+    #SRW interleaves real/imag along the fastest-varying axis. The
+    #canonical layout is (ny, nx, ne, 2); some writers produce
+    #(ne, ny, nx, 2). Try canonical first, then fall back.
     def to_complex(a):
-        re = a[0::2].reshape((ny, nx, ne)) if a.size == ny*nx*ne*2 else None
-        if re is None:
-            #Fallback: try (ne, ny, nx, 2)
+        if a.size != ny * nx * ne * 2:
+            raise ValueError(
+                f'wavefield array size {a.size} does not match '
+                f'ny*nx*ne*2 = {ny*nx*ne*2}')
+        try:
+            re = a[0::2].reshape((ny, nx, ne))
+            im = a[1::2].reshape((ny, nx, ne))
+            return (re + 1j * im).transpose(2, 0, 1)  # -> (ne, ny, nx)
+        except ValueError:
             re = a[0::2].reshape((ne, ny, nx))
             im = a[1::2].reshape((ne, ny, nx))
             return re + 1j * im
-        im = a[1::2].reshape((ny, nx, ne))
-        return (re + 1j * im).transpose(2, 0, 1)  # -> (ne, ny, nx)
 
     Ex = to_complex(arEx)
     Ey = to_complex(arEy)

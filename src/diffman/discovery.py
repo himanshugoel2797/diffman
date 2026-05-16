@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import os
 import sys
+import warnings
 from pathlib import Path
 
 
@@ -50,6 +52,13 @@ def discover(root: str = '.') -> list[dict]:
             mod = os.path.splitext(fn)[0]
             if mod in _SKIP_MODULE_NAMES:
                 continue
+            prior = DISCOVERED_PATHS.get(mod)
+            if prior is not None and prior != dirpath:
+                warnings.warn(
+                    f'duplicate pipeline module name {mod!r}: '
+                    f'{os.path.join(prior, fn)} vs {full}; '
+                    f'keeping the first', stacklevel=2)
+                continue
             DISCOVERED_PATHS[mod] = dirpath
             PATH_TO_MODULE[full] = mod
             rel = os.path.relpath(full, root_abs)
@@ -63,17 +72,28 @@ def discover(root: str = '.') -> list[dict]:
 def load_module(name: str):
     """Import a discovered pipeline module by name (idempotent).
 
-    Adds its directory to `sys.path` if not already there, then tags the
-    module's `PIPELINE` with its source path so `Pipeline.run()` can
-    git-snapshot it. Tagging happens whether or not the module was
-    already imported, so it works even if the user imported the module
-    directly before calling `load_module`.
+    Imports the file by its discovered path (without polluting sys.path,
+    so a user module named `tokenize.py` won't shadow stdlib). Falls back
+    to a normal import if `name` wasn't discovered (e.g. it's already on
+    sys.path). Tags the module's `PIPELINE` with its source path so
+    `Pipeline.run()` can git-snapshot it.
     """
     if name not in sys.modules:
         extra = DISCOVERED_PATHS.get(name)
-        if extra and extra not in sys.path:
-            sys.path.insert(0, extra)
-        importlib.import_module(name)
+        if extra:
+            path = os.path.join(extra, name + '.py')
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f'cannot load {name!r} from {path}')
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                sys.modules.pop(name, None)
+                raise
+        else:
+            importlib.import_module(name)
     mod = sys.modules[name]
     pipe = getattr(mod, 'PIPELINE', None)
     if pipe is not None:

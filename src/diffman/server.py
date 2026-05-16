@@ -552,11 +552,15 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
                 columns.append({'module': m, 'present': True,
                                 'fingerprint': v.fingerprint,
                                 'config': dict(v.config)})
-            except (KeyError, Exception) as e:
+            except Exception as e:
                 columns.append({'module': m, 'present': False,
                                 'error': str(e), 'config': {}})
 
-        rows = _flatten_union([c['config'] for c in columns])
+        #Pass None for failed modules so _flatten_union skips them
+        #(otherwise every key from successful modules would render as
+        #"missing" in the failed column instead of "errored").
+        rows = _flatten_union([c['config'] if c['present'] else None
+                               for c in columns])
         return {'variant': variant, 'columns': columns, 'rows': rows}
 
     @app.get('/api/find')
@@ -767,11 +771,15 @@ def _stage_summaries(record) -> list[dict]:
     return out
 
 
-def _flatten_union(dicts: list[dict]) -> list[dict]:
+def _flatten_union(dicts: list[Optional[dict]]) -> list[dict]:
     """Flatten N nested dicts to dotted-path rows for an N-way compare.
 
     Returns one row per leaf path, with a `values` list (one entry per
-    input dict, `None` if absent) and `equal: bool`.
+    input dict, `None` if absent) and `equal: bool`. Entries that are
+    `None` (rather than a dict) are treated as "column not available" —
+    they are excluded from key collection and equality comparison, but
+    still occupy a slot in `values` so the column index aligns with the
+    caller's column list.
     """
     def _walk(d, prefix=''):
         out = {}
@@ -786,17 +794,20 @@ def _flatten_union(dicts: list[dict]) -> list[dict]:
                 out[p] = v
         return out
 
-    flat = [_walk(d) for d in dicts]
-    keys = sorted({k for f in flat for k in f.keys()})
-    sentinel = object()
+    flat = [_walk(d) if d is not None else None for d in dicts]
+    keys = sorted({k for f in flat if f is not None for k in f.keys()})
+    missing = object()
+    unavailable = object()
     rows = []
     for k in keys:
-        vals = [f.get(k, sentinel) for f in flat]
-        present = [v if v is not sentinel else None for v in vals]
-        non_missing = [v for v in vals if v is not sentinel]
-        equal = (len(non_missing) == len(vals)
+        vals = [unavailable if f is None else f.get(k, missing) for f in flat]
+        display = [None if (v is missing or v is unavailable) else v
+                   for v in vals]
+        comparable = [v for v in vals if v is not unavailable]
+        non_missing = [v for v in comparable if v is not missing]
+        equal = (len(non_missing) == len(comparable) and len(non_missing) > 0
                  and all(v == non_missing[0] for v in non_missing))
-        rows.append({'path': k, 'values': present, 'equal': equal})
+        rows.append({'path': k, 'values': display, 'equal': equal})
     return rows
 
 

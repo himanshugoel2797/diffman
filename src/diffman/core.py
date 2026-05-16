@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -27,6 +28,9 @@ import traceback
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
+
+_log = logging.getLogger(__name__)
+_snapshot_warned = False
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +282,12 @@ class Pipeline:
                 from .git_backup import snapshot
                 snapshot(registry.root, self._source_file,
                          f'run {self.name}/{variant.name}/{variant.short_fp}')
-            except Exception:
-                pass
+            except Exception as e:
+                global _snapshot_warned
+                if not _snapshot_warned:
+                    _snapshot_warned = True
+                    _log.warning('git_backup.snapshot failed (further '
+                                 'failures will be silent): %s', e)
 
         for stage in self.stages:
             key = stage.key(variant, upstream_keys)
@@ -314,8 +322,12 @@ class Pipeline:
                 }
                 Path(stage_dir).mkdir(parents=True, exist_ok=True)
                 (Path(stage_dir) / '_meta.json').write_text(json.dumps(meta, indent=2))
-                key_file.write_text(key)
+                #Mark done and persist BEFORE writing `_key`, so a crash
+                #between the two leaves the stage looking incomplete
+                #(re-runnable) rather than cached-but-`running`.
                 ctx.record.stage_status[stage.name] = 'done'
+                registry._flush(ctx.record)
+                key_file.write_text(key)
             except Exception:
                 ctx.record.stage_status[stage.name] = 'failed'
                 ctx.record.errors[stage.name] = traceback.format_exc()
@@ -410,11 +422,21 @@ class RunRegistry:
         root = Path(self.root)
         if not root.exists():
             return out
+        known = {f.name for f in RunRecord.__dataclass_fields__.values()}
         for run_json in root.glob('*/*/*/run.json'):
             try:
-                out.append(RunRecord(**json.loads(run_json.read_text())))
-            except Exception:
+                raw = json.loads(run_json.read_text())
+            except Exception as e:
+                _log.warning('skipping %s: cannot parse: %s', run_json, e)
                 continue
+            extra = set(raw) - known
+            if extra:
+                for k in extra:
+                    raw.pop(k, None)
+            try:
+                out.append(RunRecord(**raw))
+            except TypeError as e:
+                _log.warning('skipping %s: %s', run_json, e)
         return out
 
     def list_runs(self, *, pipeline=None, variant=None) -> list[RunRecord]:
