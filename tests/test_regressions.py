@@ -342,6 +342,68 @@ def test_flatten_union_all_none_yields_no_rows():
     assert _flatten_union([None, None]) == []
 
 
+# ---------------------------------------------------------------------------
+# server.py: `_safe_under` and the `/artifact/` route used `os.path.realpath`
+# for their path-escape check. Realpath follows symlinks, and ctx.artifact
+# symlinks artifacts from outside the runs root by default — so legitimate
+# artifact downloads were getting refused with `400 path escape`. The fix
+# uses textual normpath, which still blocks `..` traversal in URLs but
+# permits symlinked artifacts.
+# ---------------------------------------------------------------------------
+
+def test_render_endpoint_serves_symlinked_artifact(scan_root, make_pipeline):
+    """Render an artifact whose backing file is a symlink to a tempfile
+    outside the runs root. Pre-fix this returned 400 because realpath
+    resolved the symlink out of the runs tree."""
+    from diffman import discovery
+    from diffman.core import registry, RunRegistry
+    from diffman.server import create_app
+    import sys
+    make_pipeline('_diffman_test_symartifact', """
+        import diffman as dm
+        dm.register('base', x=1)
+        def _f(ctx):
+            import os, tempfile
+            #tempdir is OUTSIDE the runs root — ctx.artifact symlinks it in.
+            p = os.path.join(tempfile.mkdtemp(), 'art.txt')
+            open(p, 'w').write('SYMLINK_OK')
+            ctx.artifact('s', 'art.txt', p)
+        PIPELINE = dm.Pipeline('_p_sym', [dm.Stage('s', _f)])
+    """)
+    discovery.load_module('_diffman_test_symartifact')
+    rr = RunRegistry(root=str(scan_root / 'runs'))
+    rec = sys.modules['_diffman_test_symartifact'].PIPELINE.run(
+        registry.get('_diffman_test_symartifact', 'base'), rr)
+    art_path = os.path.join(rec.fdir, 'stages', 's', 'outputs', 'art.txt')
+    # Sanity: it really is a symlink to outside the runs root.
+    assert os.path.islink(art_path)
+    assert not os.path.realpath(art_path).startswith(str(scan_root / 'runs'))
+    app = create_app(root=str(scan_root / 'runs'),
+                     scan_root=str(scan_root), no_scan=True)
+    with TestClient(app) as c:
+        r = c.get(f'/api/render?path={art_path}')
+    assert r.status_code == 200
+    assert r.json()['data'] == 'SYMLINK_OK'
+
+
+def test_artifact_route_blocks_dot_dot_traversal_in_url(scan_root):
+    """The fix relaxed the path-escape check from realpath to normpath.
+    Verify the new check still catches the actual attack: `..` segments
+    in the URL must not be allowed to climb out of the runs root."""
+    from diffman.server import create_app
+    # Plant a file outside runs that an attacker would try to read.
+    secret = scan_root / 'secret.txt'
+    secret.write_text('TOP_SECRET')
+    runs = scan_root / 'runs'; runs.mkdir()
+    app = create_app(root=str(runs), scan_root=str(scan_root), no_scan=True)
+    with TestClient(app) as c:
+        # Both percent-encoded and raw forms must be refused; the
+        # percent-encoded form is what an attacker would actually try.
+        r1 = c.get('/artifact/p/v/fp/..%2F..%2Fsecret.txt')
+        assert r1.status_code in (400, 404)
+        assert 'TOP_SECRET' not in r1.text
+
+
 def test_api_compare_handles_failed_module(scan_root, make_pipeline):
     """`/api/compare` with one bogus module name must not poison the
     rendered rows for the present modules."""
