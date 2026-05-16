@@ -95,24 +95,51 @@ def diff_configs(parent: dict, child: dict, path: str = '') -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline-forest construction
+# Fork forest construction (shared by pipeline + chain endpoints)
+# ---------------------------------------------------------------------------
+
+def _build_forest(metas: list[dict], key: str) -> list[dict]:
+    """Group entries into a parent→children forest.
+
+    Entries without `key` (e.g. error metas in the pipeline forest) fall
+    out as roots without children. An entry whose `parent` doesn't match
+    any other entry's `key` is promoted to a root and tagged with
+    `orphan_parent`.
+    """
+    known = {m[key] for m in metas if key in m}
+    children: dict[Optional[str], list[dict]] = {}
+    for m in metas:
+        if key not in m:
+            children.setdefault(None, []).append(m)
+            continue
+        parent = m.get('parent')
+        if parent and parent not in known:
+            m = {**m, 'orphan_parent': parent}
+            parent = None
+        children.setdefault(parent, []).append(m)
+
+    sort_key = lambda x: x.get(key) or x.get('module') or ''
+    def _node(m):
+        kids = sorted(children.get(m[key], []), key=sort_key) if key in m else []
+        return {**m, 'children': [_node(c) for c in kids]}
+    return [_node(r) for r in sorted(children.get(None, []), key=sort_key)]
+
+
+# ---------------------------------------------------------------------------
+# Pipeline + chain metadata extractors
 # ---------------------------------------------------------------------------
 
 def _pipeline_meta(module: str) -> Optional[dict]:
-    """Import a discovered module and report its pipeline metadata.
-
-    Returns None if the module is chain-only (declares CHAIN/CHAINS but
-    no PIPELINE), so the pipeline forest doesn't surface a misleading
-    "no PIPELINE attribute" error for a module that wasn't meant to
-    declare one.
-    """
+    """Import a module and return its pipeline metadata, or None if it
+    is chain-only (declares CHAIN/CHAINS but no PIPELINE) — chain-only
+    modules belong in /api/chains, not the pipeline forest."""
     try:
         mod = discovery.load_module(module)
     except Exception as e:
         return {'module': module, 'error': f'import failed: {e}'}
     pipe = getattr(mod, 'PIPELINE', None)
     if pipe is None:
-        if getattr(mod, 'CHAIN', None) is not None or getattr(mod, 'CHAINS', None):
+        if discovery.chains_in_module(mod):
             return None
         return {'module': module, 'error': 'no PIPELINE attribute'}
     return {
@@ -123,54 +150,6 @@ def _pipeline_meta(module: str) -> Optional[dict]:
     }
 
 
-def _build_forest(metas: list[dict]) -> list[dict]:
-    """Group pipelines into roots → children by their `parent` declaration.
-
-    Matching is by pipeline name (the string in `Pipeline('name', ...)`).
-    Pipelines whose parent doesn't match anything in the scan are treated
-    as roots and flagged via `orphan_parent`.
-    """
-    known = {m['pipeline'] for m in metas if 'pipeline' in m}
-    children: dict[Optional[str], list[dict]] = {}
-    for m in metas:
-        if 'pipeline' not in m:
-            children.setdefault(None, []).append(m)
-            continue
-        parent = m.get('parent')
-        if parent and parent not in known:
-            m = {**m, 'orphan_parent': parent}
-            parent = None
-        children.setdefault(parent, []).append(m)
-
-    def _node(m):
-        key = lambda x: x.get('pipeline') or x['module']
-        #Only nodes with a pipeline name can have children. Error metas
-        #live under `children[None]` as roots, so without this guard
-        #_node(error_meta) would recurse into its sibling roots forever.
-        kids = (sorted(children.get(m['pipeline'], []), key=key)
-                if 'pipeline' in m else [])
-        return {**m, 'children': [_node(c) for c in kids]}
-
-    return [_node(r) for r in sorted(children.get(None, []),
-                                     key=lambda x: x.get('pipeline') or x['module'])]
-
-
-# ---------------------------------------------------------------------------
-# Chain metadata + forest
-# ---------------------------------------------------------------------------
-
-def _list_chains_in_module(mod) -> list:
-    """Return every Chain object exposed by a module (CHAIN + CHAINS)."""
-    out = []
-    single = getattr(mod, 'CHAIN', None)
-    if single is not None:
-        out.append(single)
-    multi = getattr(mod, 'CHAINS', None)
-    if multi:
-        out.extend(multi)
-    return out
-
-
 def _chain_meta(chain) -> dict:
     return {
         'name': chain.name,
@@ -178,39 +157,75 @@ def _chain_meta(chain) -> dict:
         'parent': chain.parent,
         'step_count': len(chain.steps),
         'variation_count': len(chain.variations),
-        'steps': [{'name': s.name,
-                   'pipeline': s.pipeline.name,
-                   'consumes': list(s.consumes)}
-                  for s in chain.steps],
+        'steps': [{'name': s.name, 'pipeline': s.pipeline.name,
+                   'consumes': list(s.consumes)} for s in chain.steps],
     }
 
 
-def _build_chain_forest(metas: list[dict]) -> list[dict]:
-    """Group chains into a fork forest by chain `parent` declaration.
+def _resolve_variation_runs(chain, variation, all_runs) -> dict:
+    """For each step in `chain`, locate the run that belongs to
+    `variation` by matching pipeline + variant + the upstream fingerprints
+    threaded through this variation. Returns ``{step_name: RunRecord}``
+    with ``None`` for steps with no matching run (pending, unresolved
+    upstream, or variation didn't specify the step).
 
-    Same shape and orphan-flagging semantics as the pipeline forest, so
-    the UI can render them identically.
+    This is the upstream-fp join shared by /api/chain_progress and
+    /api/scoreboard — both endpoints need to walk a variation's
+    expected chain and pin down the corresponding on-disk runs.
     """
-    known = {m['name'] for m in metas if 'name' in m}
-    children: dict[Optional[str], list[dict]] = {}
-    for m in metas:
-        if 'name' not in m:
-            children.setdefault(None, []).append(m)
+    mapping = variation.resolve()
+    runs: dict = {s.name: None for s in chain.steps}
+    upstream_fps: dict = {}
+    for step in chain.steps:
+        variant_name = mapping.get(step.name)
+        if variant_name is None:
+            upstream_fps[step.name] = None
             continue
-        parent = m.get('parent')
-        if parent and parent not in known:
-            m = {**m, 'orphan_parent': parent}
-            parent = None
-        children.setdefault(parent, []).append(m)
+        required = {u: upstream_fps.get(u) for u in step.consumes}
+        if any(v is None for v in required.values()):
+            upstream_fps[step.name] = None
+            continue
+        for r in all_runs:
+            if (r.pipeline == step.pipeline.name
+                    and r.variant == variant_name
+                    and r.upstream == required):
+                runs[step.name] = r
+                upstream_fps[step.name] = r.fingerprint
+                break
+        else:
+            upstream_fps[step.name] = None
+    return runs
 
-    def _node(m):
-        key = lambda x: x.get('name') or x.get('module') or ''
-        kids = (sorted(children.get(m['name'], []), key=key)
-                if 'name' in m else [])
-        return {**m, 'children': [_node(c) for c in kids]}
 
-    return [_node(r) for r in sorted(children.get(None, []),
-                                     key=lambda x: x.get('name') or x.get('module') or '')]
+def _summarize_stage_status(stage_status: dict) -> str:
+    """Roll a stage_status dict up into a single chain-step status."""
+    statuses = set(stage_status.values())
+    if 'failed' in statuses:
+        return 'failed'
+    if statuses == {'cached'}:
+        return 'cached'
+    if statuses and statuses <= {'done', 'cached'}:
+        return 'done'
+    if not statuses:
+        return 'pending'
+    return 'mixed'
+
+
+def _load_stage_metrics(fdir: str):
+    """Yield ``(stage_name, metrics_dict)`` for each stage under `fdir`
+    that has a parseable metrics.json. Skips silently on missing or
+    malformed files — metrics are best-effort instrumentation."""
+    stages_dir = os.path.join(fdir, 'stages')
+    if not os.path.isdir(stages_dir):
+        return
+    for st_name in sorted(os.listdir(stages_dir)):
+        mp = os.path.join(stages_dir, st_name, 'metrics.json')
+        try:
+            data = json.loads(Path(mp).read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        if isinstance(data, dict):
+            yield st_name, data
 
 
 def _load_chain(name: str):
@@ -230,7 +245,7 @@ def _load_chain(name: str):
             raise HTTPException(status_code=404,
                                 detail=f'chain {name!r} not found')
     mod = discovery.load_module(mod_name)
-    for ch in _list_chains_in_module(mod):
+    for ch in discovery.chains_in_module(mod):
         if ch.name == name:
             return ch, mod_name
     raise HTTPException(status_code=404,
@@ -427,7 +442,7 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
                  if m is not None]
         return {
             'scan_root': os.path.abspath(app.state.scan_root),
-            'forest': _build_forest(metas),
+            'forest': _build_forest(metas, key='pipeline'),
         }
 
     # --- variants / describe --------------------------------------------
@@ -722,41 +737,35 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
                 mod = discovery.load_module(entry['module'])
             except Exception:
                 continue
-            for ch in _list_chains_in_module(mod):
+            for ch in discovery.chains_in_module(mod):
                 if ch.name in seen:
                     continue
                 seen.add(ch.name)
                 chains.append(_chain_meta(ch))
-        return {'forest': _build_chain_forest(chains)}
+        return {'forest': _build_forest(chains, key='name')}
 
     @app.get('/api/chain/{name}')
     def _chain_detail(name: str):
-        chain, mod_name = _load_chain(name)
+        chain, _ = _load_chain(name)
         variations = []
         for v in chain.variations.values():
             try:
-                mapping = v.resolve()
-                err = None
+                mapping, err = v.resolve(), None
             except Exception as e:
-                mapping = dict(v.overrides)
-                err = str(e)
+                mapping, err = dict(v.overrides), str(e)
             variations.append({'name': v.name, 'base': v.base,
                                'overrides': dict(v.overrides),
                                'mapping': mapping, 'error': err})
-        return {
-            **_chain_meta(chain),
-            'module': mod_name,
-            'variations': variations,
-        }
+        return {**_chain_meta(chain), 'variations': variations}
 
     @app.get('/api/chain_progress/{name}/{variation}')
     def _chain_progress(name: str, variation: str):
         """Per-step status of a chain variation, reconstructed from the
         upstream provenance recorded in each run.json.
 
-        Returns one entry per chain step with: `status` (done / cached /
-        failed / pending / mixed), the run's short_fp (if any), and
-        per-stage statuses & errors for failed-step diagnostics.
+        Each entry: `status` (done / cached / failed / pending / mixed /
+        unspecified), the run's short_fp + fingerprint when matched, and
+        per-stage statuses + errors for inline failed-step diagnostics.
         """
         chain, _ = _load_chain(name)
         if variation not in chain.variations:
@@ -767,66 +776,24 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
             mapping = chain.variations[variation].resolve()
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
-
-        all_runs = app.state.registry.list_runs()
+        matched = _resolve_variation_runs(
+            chain, chain.variations[variation],
+            app.state.registry.list_runs())
         steps = []
-        upstream_fps: dict[str, Optional[str]] = {}
         for step in chain.steps:
             variant_name = mapping.get(step.name)
-            entry = {'name': step.name,
-                     'pipeline': step.pipeline.name,
-                     'variant': variant_name,
-                     'consumes': list(step.consumes),
-                     'status': 'pending',
-                     'short_fp': None,
-                     'fingerprint': None,
-                     'stage_status': {},
-                     'errors': {}}
-            if variant_name is None:
-                entry['status'] = 'unspecified'
-                upstream_fps[step.name] = None
-                steps.append(entry)
-                continue
-            #Find candidate runs whose upstream provenance matches what
-            #earlier steps in this variation produced. None upstream
-            #means we couldn't resolve an earlier step → treat as
-            #pending without trying to match.
-            required = {u: upstream_fps.get(u) for u in step.consumes}
-            if any(v is None for v in required.values()):
-                upstream_fps[step.name] = None
-                steps.append(entry)
-                continue
-            match = None
-            for r in all_runs:
-                if r.pipeline != step.pipeline.name:
-                    continue
-                if r.variant != variant_name:
-                    continue
-                if dict(r.upstream or {}) != required:
-                    continue
-                match = r
-                break
-            if match is None:
-                upstream_fps[step.name] = None
-                steps.append(entry)
-                continue
-            statuses = set(match.stage_status.values())
-            if 'failed' in statuses:
-                entry['status'] = 'failed'
-            elif statuses == {'cached'}:
-                entry['status'] = 'cached'
-            elif statuses and statuses <= {'done', 'cached'}:
-                entry['status'] = 'done'
-            elif not statuses:
-                entry['status'] = 'pending'
-            else:
-                entry['status'] = 'mixed'
-            entry['short_fp'] = match.fingerprint[:12]
-            entry['fingerprint'] = match.fingerprint
-            entry['stage_status'] = dict(match.stage_status)
-            entry['errors'] = dict(match.errors)
-            upstream_fps[step.name] = match.fingerprint
-            steps.append(entry)
+            r = matched[step.name]
+            steps.append({
+                'name': step.name, 'pipeline': step.pipeline.name,
+                'variant': variant_name, 'consumes': list(step.consumes),
+                'status': ('unspecified' if variant_name is None
+                           else _summarize_stage_status(r.stage_status)
+                           if r is not None else 'pending'),
+                'short_fp': r.fingerprint[:12] if r else None,
+                'fingerprint': r.fingerprint if r else None,
+                'stage_status': dict(r.stage_status) if r else {},
+                'errors': dict(r.errors) if r else {},
+            })
         return {'chain': name, 'variation': variation, 'steps': steps}
 
     @app.get('/api/chain_source_diff')
@@ -909,67 +876,29 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
 
     @app.get('/api/scoreboard/{name}')
     def _scoreboard(name: str):
-        """Cross-variation scoreboard: rows = variations, columns =
-        every metric name written via `ctx.metric()` across the chain's
-        runs. Metric values come from each stage's metrics.json file.
+        """Cross-variation scoreboard. One row per chain variation, one
+        column per metric key (``<step>.<stage>.<name>``) written via
+        ``ctx.metric()``.
         """
         chain, _ = _load_chain(name)
         all_runs = app.state.registry.list_runs()
-        #Index runs by pipeline+variant+upstream-fp signature for fast
-        #lookup, same logic as _chain_progress.
         rows = []
         all_metric_keys: set[str] = set()
         for var_name, var in chain.variations.items():
             try:
-                mapping = var.resolve()
-            except Exception:
-                continue
-            upstream_fps: dict[str, Optional[str]] = {}
-            metrics: dict[str, dict] = {}
+                matched = _resolve_variation_runs(chain, var, all_runs)
+            except KeyError:
+                continue   #malformed variation (e.g. unresolved base=)
+            flat: dict = {}
             for step in chain.steps:
-                variant_name = mapping.get(step.name)
-                if variant_name is None:
-                    upstream_fps[step.name] = None
+                run = matched[step.name]
+                if run is None:
                     continue
-                required = {u: upstream_fps.get(u) for u in step.consumes}
-                if any(v is None for v in required.values()):
-                    upstream_fps[step.name] = None
-                    continue
-                match = None
-                for r in all_runs:
-                    if r.pipeline != step.pipeline.name: continue
-                    if r.variant != variant_name: continue
-                    if dict(r.upstream or {}) != required: continue
-                    match = r
-                    break
-                if match is None:
-                    upstream_fps[step.name] = None
-                    continue
-                upstream_fps[step.name] = match.fingerprint
-                #Collect metrics from every stage's metrics.json.
-                stages_dir = os.path.join(match.fdir, 'stages')
-                if not os.path.isdir(stages_dir):
-                    continue
-                step_metrics = {}
-                for st in sorted(os.listdir(stages_dir)):
-                    mp = os.path.join(stages_dir, st, 'metrics.json')
-                    if not os.path.isfile(mp):
-                        continue
-                    try:
-                        data = json.loads(Path(mp).read_text())
-                    except Exception:
-                        continue
-                    if not isinstance(data, dict):
-                        continue
-                    for k, v in data.items():
-                        key = f'{step.name}.{st}.{k}'
-                        step_metrics[key] = v
+                for st_name, st_metrics in _load_stage_metrics(run.fdir):
+                    for k, v in st_metrics.items():
+                        key = f'{step.name}.{st_name}.{k}'
+                        flat[key] = v
                         all_metric_keys.add(key)
-                metrics[step.name] = step_metrics
-            #Flatten this variation's metrics into one row.
-            flat = {}
-            for step_metrics in metrics.values():
-                flat.update(step_metrics)
             rows.append({'variation': var_name, 'metrics': flat})
         return {'chain': name,
                 'metric_keys': sorted(all_metric_keys),

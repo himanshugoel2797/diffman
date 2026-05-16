@@ -46,7 +46,7 @@ def test_build_forest_nests_children_under_parent():
         {'module': 'b', 'pipeline': 'b', 'parent': 'a',     'variant_count': 2},
         {'module': 'c', 'pipeline': 'c', 'parent': 'b',     'variant_count': 0},
     ]
-    forest = _build_forest(metas)
+    forest = _build_forest(metas, key='pipeline')
     assert len(forest) == 1
     assert forest[0]['pipeline'] == 'a'
     assert len(forest[0]['children']) == 1
@@ -59,7 +59,7 @@ def test_build_forest_orphans_become_roots_with_flag():
         {'module': 'orphan', 'pipeline': 'orphan',
          'parent': 'ghost', 'variant_count': 1},
     ]
-    forest = _build_forest(metas)
+    forest = _build_forest(metas, key='pipeline')
     assert forest[0]['orphan_parent'] == 'ghost'
     assert forest[0]['children'] == []
 

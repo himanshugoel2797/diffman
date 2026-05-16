@@ -28,10 +28,37 @@ import time
 import traceback
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Optional
 
 _log = logging.getLogger(__name__)
-_snapshot_warned = False
+
+
+def _caller_module() -> Optional[str]:
+    """Return the calling frame's __name__, two frames up.
+
+    Used by `register()` and `Pipeline()` to attribute themselves to the
+    file that constructed them — same source captured by both, so the
+    chain layer can resolve a step's variant against the right module.
+    """
+    return inspect.currentframe().f_back.f_back.f_globals.get('__name__')
+
+
+def _try_snapshot(root: str, source_file: str, message: str,
+                  _warned: list = [False]) -> None:
+    """Best-effort git snapshot of a pipeline / chain source file.
+
+    Failures (no git, no write perms) are logged once and then silently
+    swallowed — snapshotting is a nice-to-have for traceability, never
+    a blocker for the actual run.
+    """
+    try:
+        from .git_backup import snapshot
+        snapshot(root, source_file, message)
+    except Exception as e:
+        if not _warned[0]:
+            _warned[0] = True
+            _log.warning('git_backup.snapshot failed (further failures '
+                         'will be silent): %s', e)
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +167,7 @@ class Variant:
 
     @property
     def fingerprint(self) -> str:
-        return fingerprint(_to_plain(self.config))
+        return fingerprint(self.config)
 
     @property
     def short_fp(self) -> str:
@@ -149,13 +176,6 @@ class Variant:
     def __repr__(self):
         b = self.base.name if self.base else None
         return f'Variant({self.name!r}, base={b!r}, module={self.module!r})'
-
-
-def _to_plain(d) -> dict:
-    """Strip Config wrappers so json.dumps sees vanilla dicts everywhere."""
-    if isinstance(d, dict):
-        return {k: _to_plain(v) for k, v in d.items()}
-    return d
 
 
 class VariantRegistry:
@@ -220,9 +240,7 @@ def register(name: str, *, base: Optional[str] = None,
     descendant of `other_variant` in the parent pipeline; the UI uses it
     to line up cross-fork diffs when variant names changed.
     """
-    caller = inspect.currentframe().f_back
-    mod_name = caller.f_globals.get('__name__') if caller else None
-    return registry.register(name, base=base, module=mod_name,
+    return registry.register(name, base=base, module=_caller_module(),
                              forks_of=forks_of, **overrides)
 
 
@@ -244,7 +262,7 @@ class Stage:
         return fingerprint({
             'stage': self.name,
             'fn': _fn_source_hash(self.fn),
-            'config': _to_plain(cfg),
+            'config': cfg,
             'upstream': {k: upstream_keys[k] for k in self.inputs},
         })
 
@@ -260,15 +278,13 @@ class Pipeline:
         self.parent = parent  # name of the pipeline this was forked from
         self._source_file: Optional[str] = None  # set by discovery.load_module
         #Caller's __name__ — used by Chain to resolve variant names against
-        #the right module-scoped registry entry. Can be overridden for tests.
-        if module is None:
-            caller = inspect.currentframe().f_back
-            module = caller.f_globals.get('__name__') if caller else None
-        self._module = module
+        #the right module-scoped registry entry. Pass `module=` explicitly
+        #to override (constructing Pipelines dynamically in tests).
+        self._module = module if module is not None else _caller_module()
         self._validate()
 
     def _validate(self):
-        seen = set()
+        seen: set[str] = set()
         for s in self.stages:
             for inp in s.inputs:
                 if inp not in seen:
@@ -285,59 +301,41 @@ class Pipeline:
             variation: Optional[str] = None) -> 'RunRecord':
         force = set(force or ())
         only = set(only) if only else None
-        upstream = dict(upstream or {})
         ctx = registry.open_run(self.name, variant,
-                                upstream=upstream,
-                                chain=chain,
-                                variation=variation)
-        upstream_keys: dict[str, str] = {}
+                                upstream=upstream or {},
+                                chain=chain, variation=variation)
 
         if self._source_file:
-            try:
-                from .git_backup import snapshot
-                snapshot(registry.root, self._source_file,
-                         f'run {self.name}/{variant.name}/'
-                         f'{ctx.record.fingerprint[:12]}')
-            except Exception as e:
-                global _snapshot_warned
-                if not _snapshot_warned:
-                    _snapshot_warned = True
-                    _log.warning('git_backup.snapshot failed (further '
-                                 'failures will be silent): %s', e)
+            _try_snapshot(registry.root, self._source_file,
+                          f'run {self.name}/{variant.name}/'
+                          f'{ctx.record.fingerprint[:12]}')
 
+        upstream_keys: dict[str, str] = {}
         for stage in self.stages:
             key = stage.key(variant, upstream_keys)
             ctx.record.stage_keys[stage.name] = key
+            upstream_keys[stage.name] = key
 
-            run_stage = only is None or stage.name in only
-            if stage.name in force:
-                run_stage = True
-
-            stage_dir = ctx.stage_dir(stage.name)
-            key_file = Path(stage_dir) / '_key'
-            cached = key_file.exists() and key_file.read_text().strip() == key
-
-            if not run_stage:
+            if only is not None and stage.name not in only \
+                    and stage.name not in force:
                 ctx.record.stage_status[stage.name] = 'skipped'
-                upstream_keys[stage.name] = key
                 continue
-            if cached and stage.name not in force:
+
+            stage_dir = Path(ctx.stage_dir(stage.name))
+            key_file = stage_dir / '_key'
+            if (stage.name not in force and key_file.exists()
+                    and key_file.read_text().strip() == key):
                 ctx.record.stage_status[stage.name] = 'cached'
-                upstream_keys[stage.name] = key
                 continue
 
             ctx.record.stage_status[stage.name] = 'running'
             registry._flush(ctx.record)
             t0 = time.time()
             try:
-                outputs = stage.fn(ctx) or {}
-                meta = {
-                    'name': stage.name, 'key': key,
-                    'started': t0, 'ended': time.time(),
-                    'outputs': {k: str(v) for k, v in outputs.items()},
-                }
-                Path(stage_dir).mkdir(parents=True, exist_ok=True)
-                (Path(stage_dir) / '_meta.json').write_text(json.dumps(meta, indent=2))
+                stage.fn(ctx)
+                (stage_dir / '_meta.json').write_text(json.dumps(
+                    {'name': stage.name, 'key': key,
+                     'started': t0, 'ended': time.time()}, indent=2))
                 #Mark done and persist BEFORE writing `_key`, so a crash
                 #between the two leaves the stage looking incomplete
                 #(re-runnable) rather than cached-but-`running`.
@@ -349,7 +347,6 @@ class Pipeline:
                 ctx.record.errors[stage.name] = traceback.format_exc()
                 registry._flush(ctx.record)
                 raise
-            upstream_keys[stage.name] = key
             registry._flush(ctx.record)
 
         ctx.record.ended = _now()
@@ -362,16 +359,19 @@ class Pipeline:
 # ---------------------------------------------------------------------------
 
 def _run_fingerprint(variant: Variant, upstream: dict) -> str:
-    """Per-run fingerprint folding in the variant config and any upstream
-    run fingerprints. Equals ``variant.fingerprint`` when there's no
-    upstream, so plain (un-chained) runs keep their existing directory
-    layout."""
+    """Per-run fingerprint that folds in upstream run fingerprints.
+
+    Equals ``variant.fingerprint`` when there's no upstream, so an
+    un-chained pipeline's run-dir name matches the fingerprint that
+    ``dm describe`` prints — useful for hand navigation. With upstream,
+    it hashes the (variant, upstream-fps) tuple so distinct upstream
+    chains produce distinct downstream dirs.
+    """
     if not upstream:
         return variant.fingerprint
     return fingerprint({
         'variant': variant.fingerprint,
-        'upstream': {name: rec.fingerprint
-                     for name, rec in sorted(upstream.items())},
+        'upstream': {name: rec.fingerprint for name, rec in upstream.items()},
     })
 
 
@@ -471,38 +471,25 @@ class Chain:
 
     def _run(self, variation: Variation, rr: 'RunRegistry') -> dict:
         mapping = variation.resolve()
-        runs: dict[str, RunRecord] = {}
         if self._source_file:
-            try:
-                from .git_backup import snapshot
-                snapshot(rr.root, self._source_file,
-                         f'chain {self.name}/{variation.name}')
-            except Exception as e:
-                global _snapshot_warned
-                if not _snapshot_warned:
-                    _snapshot_warned = True
-                    _log.warning('git_backup.snapshot failed (further '
-                                 'failures will be silent): %s', e)
+            _try_snapshot(rr.root, self._source_file,
+                          f'chain {self.name}/{variation.name}')
+        runs: dict[str, RunRecord] = {}
         for step in self.steps:
             if step.name not in mapping:
                 raise KeyError(
                     f'variation {variation.name!r} does not specify '
                     f'a variant for step {step.name!r}')
-            variant_name = mapping[step.name]
             module = step.pipeline._module
             if module is None:
                 raise RuntimeError(
                     f'pipeline {step.pipeline.name!r} has no module '
                     f'attribution; cannot resolve variant '
-                    f'{variant_name!r} from the registry')
-            variant = registry.get(module, variant_name)
-            upstream = {u: runs[u] for u in step.consumes}
-            record = step.pipeline.run(
-                variant, rr,
-                upstream=upstream,
-                chain=self.name,
-                variation=variation.name)
-            runs[step.name] = record
+                    f'{mapping[step.name]!r} from the registry')
+            runs[step.name] = step.pipeline.run(
+                registry.get(module, mapping[step.name]), rr,
+                upstream={u: runs[u] for u in step.consumes},
+                chain=self.name, variation=variation.name)
         return runs
 
 
@@ -552,26 +539,6 @@ class RunContext:
         rec = self.upstream[step_name]
         return os.path.join(rec.fdir, relpath) if relpath else rec.fdir
 
-    def metric(self, stage_name: str, name: str, value) -> None:
-        """Append a scalar/aggregate metric for a stage.
-
-        Metrics are JSON-encoded values written to
-        ``stages/<stage>/metrics.json`` as a flat dict; repeat calls with
-        the same `name` overwrite. The scoreboard endpoint aggregates
-        these across the runs of a chain so an ablation sweep can be
-        read at a glance (avg_flux, frc_score, etc.).
-        """
-        d = self.stage_dir(stage_name)
-        path = os.path.join(d, 'metrics.json')
-        try:
-            data = json.loads(Path(path).read_text()) if os.path.exists(path) else {}
-        except (json.JSONDecodeError, OSError):
-            data = {}
-        if not isinstance(data, dict):
-            data = {}
-        data[name] = value
-        Path(path).write_text(json.dumps(data, indent=2, default=str))
-
     def stage_dir(self, stage_name: str) -> str:
         d = os.path.join(self.fdir, 'stages', stage_name)
         os.makedirs(os.path.join(d, 'outputs'), exist_ok=True)
@@ -583,8 +550,8 @@ class RunContext:
         The pipeline writes its output wherever convenient (often a path
         chosen by an external tool); this method links it into
         ``stages/<stage>/outputs/<relpath>`` so diffman can serve it.
-        Symlinks when the OS supports them, falls back to copy / copytree
-        otherwise. Returns the destination path.
+        Symlinks when supported, falls back to copy / copytree otherwise.
+        Returns the destination path.
         """
         src = os.path.abspath(source)
         if not os.path.exists(src):
@@ -599,17 +566,32 @@ class RunContext:
         try:
             os.symlink(src, dest)
         except (OSError, NotImplementedError, AttributeError):
-            #Symlinks unsupported (e.g. Windows without privilege) or the
-            #filesystem rejected it; fall back to a real copy.
-            if os.path.isdir(src):
-                shutil.copytree(src, dest)
-            else:
-                shutil.copy2(src, dest)
+            #Symlinks unsupported (Windows without privilege, exotic FS);
+            #fall back to a real copy.
+            (shutil.copytree if os.path.isdir(src) else shutil.copy2)(src, dest)
         return dest
 
-    def log(self, msg: str) -> None:
-        with open(os.path.join(self.fdir, 'run.log'), 'a') as f:
-            f.write(f'[{_now()}] {msg}\n')
+    def metric(self, stage_name: str, name: str, value) -> None:
+        """Record a scalar metric under ``stages/<stage>/metrics.json``.
+
+        Repeat calls with the same `name` overwrite. The scoreboard
+        endpoint aggregates these across a chain's variations into one
+        ablation-sweep table (avg_flux, frc_score, etc.). Pre-existing
+        non-dict / malformed JSON at the path is reset rather than raised
+        so a corrupt write from a prior crash doesn't poison further
+        metric() calls.
+        """
+        path = Path(self.stage_dir(stage_name), 'metrics.json')
+        data: dict = {}
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text())
+                if isinstance(loaded, dict):
+                    data = loaded
+            except json.JSONDecodeError:
+                pass
+        data[name] = value
+        path.write_text(json.dumps(data, indent=2, default=str))
 
 
 class RunRegistry:
@@ -630,32 +612,25 @@ class RunRegistry:
                  upstream: Optional[dict] = None,
                  chain: Optional[str] = None,
                  variation: Optional[str] = None) -> RunContext:
-        upstream = dict(upstream or {})
+        upstream = upstream or {}
         run_fp = _run_fingerprint(variant, upstream)
         fdir = os.path.join(self.root, pipeline, variant.name, run_fp[:12])
         os.makedirs(fdir, exist_ok=True)
         record = RunRecord(
-            pipeline=pipeline,
-            variant=variant.name,
-            fingerprint=run_fp,
-            fdir=fdir,
-            started=_now(),
-            git_rev=_git_rev(),
-            host=socket.gethostname(),
-            chain=chain,
-            variation=variation,
-            upstream={name: rec.fingerprint for name, rec in upstream.items()},
+            pipeline=pipeline, variant=variant.name,
+            fingerprint=run_fp, fdir=fdir, started=_now(),
+            git_rev=_git_rev(), host=socket.gethostname(),
+            chain=chain, variation=variation,
+            upstream={n: r.fingerprint for n, r in upstream.items()},
         )
-        ctx = RunContext(fdir, variant, record, upstream=upstream)
         self._flush(record)
-        with open(os.path.join(fdir, 'config.json'), 'w') as f:
-            json.dump(_to_plain(variant.config), f, indent=2, default=str)
-        self._cache = None
-        return ctx
+        Path(fdir, 'config.json').write_text(
+            json.dumps(variant.config, indent=2, default=str))
+        return RunContext(fdir, variant, record, upstream=upstream)
 
     def _flush(self, record: RunRecord) -> None:
-        with open(os.path.join(record.fdir, 'run.json'), 'w') as f:
-            json.dump(asdict(record), f, indent=2, default=str)
+        Path(record.fdir, 'run.json').write_text(
+            json.dumps(asdict(record), indent=2, default=str))
         self._cache = None
 
     def _load_all(self) -> list[RunRecord]:
@@ -663,20 +638,13 @@ class RunRegistry:
         root = Path(self.root)
         if not root.exists():
             return out
-        known = {f.name for f in RunRecord.__dataclass_fields__.values()}
+        known = set(RunRecord.__dataclass_fields__)
         for run_json in root.glob('*/*/*/run.json'):
             try:
                 raw = json.loads(run_json.read_text())
-            except Exception as e:
-                _log.warning('skipping %s: cannot parse: %s', run_json, e)
-                continue
-            extra = set(raw) - known
-            if extra:
-                for k in extra:
-                    raw.pop(k, None)
-            try:
-                out.append(RunRecord(**raw))
-            except TypeError as e:
+                out.append(RunRecord(**{k: v for k, v in raw.items()
+                                        if k in known}))
+            except (json.JSONDecodeError, TypeError) as e:
                 _log.warning('skipping %s: %s', run_json, e)
         return out
 

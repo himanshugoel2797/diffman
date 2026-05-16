@@ -86,8 +86,7 @@ def _stage_sim(ctx):
     cfg = ctx.variant.config
     tmp = '/tmp/out.npy'              # or wherever the tool wrote it
     np.save(tmp, …)
-    out = ctx.artifact('sim', 'out.npy', tmp)   # symlink or copy into the run
-    return {'out': out}
+    ctx.artifact('sim', 'out.npy', tmp)   # symlink or copy into the run
 
 PIPELINE = dm.Pipeline('myname', [
     dm.Stage('sim', _stage_sim, config_keys=('scan', 'probe')),

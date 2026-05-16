@@ -75,14 +75,25 @@ def discover(root: str = '.') -> list[dict]:
     return found
 
 
+def chains_in_module(mod) -> list:
+    """Every Chain a module exposes — a single ``CHAIN`` plus any in
+    ``CHAINS = [...]``. Order: CHAIN first, then CHAINS in declaration
+    order."""
+    out = []
+    if getattr(mod, 'CHAIN', None) is not None:
+        out.append(mod.CHAIN)
+    out.extend(getattr(mod, 'CHAINS', None) or [])
+    return out
+
+
 def load_module(name: str):
     """Import a discovered pipeline module by name (idempotent).
 
     Imports the file by its discovered path (without polluting sys.path,
-    so a user module named `tokenize.py` won't shadow stdlib). Falls back
-    to a normal import if `name` wasn't discovered (e.g. it's already on
-    sys.path). Tags the module's `PIPELINE` with its source path so
-    `Pipeline.run()` can git-snapshot it.
+    so a user module named ``tokenize.py`` won't shadow stdlib). Falls
+    back to a normal import if ``name`` wasn't discovered (e.g. already
+    on sys.path). Tags each discovered Pipeline / Chain with its source
+    path so the run-time git-snapshot has something to snapshot.
     """
     if name not in sys.modules:
         extra = DISCOVERED_PATHS.get(name)
@@ -101,29 +112,15 @@ def load_module(name: str):
         else:
             importlib.import_module(name)
     mod = sys.modules[name]
+    src = getattr(mod, '__file__', None)
     pipe = getattr(mod, 'PIPELINE', None)
     if pipe is not None:
-        if getattr(pipe, '_source_file', None) is None:
-            try:
-                pipe._source_file = getattr(mod, '__file__', None)
-            except Exception:
-                pass
+        if pipe._source_file is None:
+            pipe._source_file = src
         PIPELINE_TO_MODULE[pipe.name] = name
-    #Chains: a module may define a single `CHAIN` or a list `CHAINS`.
-    chains: list = []
-    single = getattr(mod, 'CHAIN', None)
-    if single is not None:
-        chains.append(single)
-    multi = getattr(mod, 'CHAINS', None)
-    if multi:
-        chains.extend(multi)
-    src = getattr(mod, '__file__', None)
-    for ch in chains:
-        if getattr(ch, '_source_file', None) is None:
-            try:
-                ch._source_file = src
-            except Exception:
-                pass
+    for ch in chains_in_module(mod):
+        if ch._source_file is None:
+            ch._source_file = src
         CHAIN_TO_MODULE[ch.name] = name
     return mod
 
@@ -135,13 +132,9 @@ def evict_module(name: str) -> None:
     sys.modules entry, the pipeline- and chain-name reverse mappings,
     and any variants attributed to this module in the global registry.
     """
-    import sys
     from .core import registry as _reg
     sys.modules.pop(name, None)
-    for pn, mn in list(PIPELINE_TO_MODULE.items()):
-        if mn == name:
-            del PIPELINE_TO_MODULE[pn]
-    for cn, mn in list(CHAIN_TO_MODULE.items()):
-        if mn == name:
-            del CHAIN_TO_MODULE[cn]
+    for d in (PIPELINE_TO_MODULE, CHAIN_TO_MODULE):
+        for k in [k for k, v in d.items() if v == name]:
+            del d[k]
     _reg.drop_module(name)

@@ -242,25 +242,19 @@ def test_list_runs_skips_malformed_with_warning(scan_root, caplog):
 def test_snapshot_failure_is_logged_at_least_once(scan_root, monkeypatch,
                                                    caplog):
     from diffman import core
-    monkeypatch.setattr(core, '_snapshot_warned', False)
 
     def boom(*a, **kw):
         raise RuntimeError('git crash')
 
-    def fake_import(name, *a, **kw):
-        # core.Pipeline.run imports git_backup lazily; intercept that.
-        if name == 'diffman.git_backup' or name == '.git_backup':
-            raise RuntimeError('git crash')
-        return original_import(name, *a, **kw)
-
-    # Easier: monkey-patch the function directly.
     import diffman.git_backup as gb
     monkeypatch.setattr(gb, 'snapshot', boom)
+    #_try_snapshot uses a mutable default for its "already warned" flag;
+    #monkeypatch a fresh list so the warning fires for THIS test.
+    monkeypatch.setattr(core._try_snapshot, '__defaults__', ([False],))
 
     v = core.registry.register('only', module='_diffman_test_snap', x=1)
-    pipe = core.Pipeline('_pipe_snap', [core.Stage('sim', lambda ctx: {})])
-    # Force a source file so the snapshot path is taken.
-    pipe._source_file = __file__
+    pipe = core.Pipeline('_pipe_snap', [core.Stage('sim', lambda ctx: None)])
+    pipe._source_file = __file__   #force the snapshot path to fire
     reg = core.RunRegistry(root=str(scan_root / 'runs'))
     with caplog.at_level(logging.WARNING, logger='diffman.core'):
         pipe.run(v, reg)

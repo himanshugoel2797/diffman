@@ -13,9 +13,7 @@ from fastapi.testclient import TestClient
 
 import diffman as dm
 from diffman import discovery
-from diffman.server import (
-    create_app, _build_chain_forest, _list_chains_in_module,
-)
+from diffman.server import create_app, _build_forest
 
 
 # ---------------------------------------------------------------------------
@@ -149,19 +147,19 @@ class TestChainDiscovery:
 
 class TestChainForest:
     def test_forest_nests_child_under_parent(self):
-        forest = _build_chain_forest([
+        forest = _build_forest([
             {'name': 'a', 'parent': None, 'step_count': 1, 'variation_count': 0},
             {'name': 'b', 'parent': 'a',  'step_count': 1, 'variation_count': 0},
-        ])
+        ], key='name')
         assert len(forest) == 1
         assert forest[0]['name'] == 'a'
         assert forest[0]['children'][0]['name'] == 'b'
 
     def test_forest_flags_orphan_parent(self):
-        forest = _build_chain_forest([
+        forest = _build_forest([
             {'name': 'lone', 'parent': 'ghost',
              'step_count': 1, 'variation_count': 0},
-        ])
+        ], key='name')
         assert forest[0]['orphan_parent'] == 'ghost'
 
 
