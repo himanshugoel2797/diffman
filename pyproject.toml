@@ -35,11 +35,9 @@ where = ["src"]
 diffman = ["ui/*.html", "ui/*.js", "ui/*.css"]
 
 # ---------------------------------------------------------------------------
-# pixi — `pixi install` provisions a project-local conda+pypi environment
-# with srwpy (from conda-forge) pre-installed, so the SRW-aware previews
-# work out of the box.  Run with:
+# pixi — optional project-local conda+pypi environment. Run with:
 #     pixi run serve
-# or drop into the env with `pixi shell` and use the `diffman` CLI directly.
+# or `pixi shell` to use the `diffman` CLI directly.
 # ---------------------------------------------------------------------------
 
 [tool.pixi.workspace]

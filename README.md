@@ -9,7 +9,8 @@
 diffman tracks the graph of how simulation pipelines are *forked* from
 one another and shows the parameter differences at each fork. It
 discovers runs produced by those pipelines and serves them through a
-read-only web UI with SRW-aware previews of `.h5` / `.dat` artifacts.
+read-only web UI with previews for common artifact formats
+(`.npy`, `.json`, `.h5`, images, plain text).
 
 diffman does **not** launch runs. Your script (or scheduler) runs the
 pipeline; diffman observes the resulting run directories and explains
@@ -41,32 +42,11 @@ how variants relate to one another.
                └── parent=pipe_b
 ```
 
-Grew out of a prototype, `srwl_uti_diffman.py`, written against SRW.
-That prototype was a single-file, stdlib-only sketch and is not
-shipped with SRW; diffman is the standalone, fleshed-out version,
-with SRW awareness kept as an optional integration rather than a
-hard dependency.
-
 ## Install
-
-### pip
 
 ```bash
 pip install diffman              # core
 pip install "diffman[all]"       # + h5py + plotly previews
-pip install srwpy                # optional: SRW-aware .h5 / .dat previews
-```
-
-### pixi (recommended for SRW users)
-
-Provisions a project-local conda+pypi env with `srwpy` pre-installed,
-so SRW previews work out of the box:
-
-```bash
-pixi install
-pixi run scan
-pixi run serve              # http://127.0.0.1:8765
-pixi shell                  # or drop in and use the `diffman` CLI
 ```
 
 ### From source
@@ -75,6 +55,16 @@ pixi shell                  # or drop in and use the `diffman` CLI
 git clone https://github.com/dotnet00/diffman
 cd diffman
 pip install -e ".[all,dev]"
+```
+
+### pixi
+
+A `pixi` workspace is included for users who prefer a project-local
+conda+pypi environment:
+
+```bash
+pixi install
+pixi run serve              # http://127.0.0.1:8765
 ```
 
 ## Concepts
@@ -194,7 +184,7 @@ GET  /api/runs                                  → all run records
 GET  /api/run/{p}/{v}/{fp}                      → single run + stages
 GET  /api/stage/{p}/{v}/{fp}/{stage}            → stage detail + artifacts
 GET  /api/render?path=                          → renderer payload
-GET  /api/srw_preview?path=                     → SRW heatmap + h/v cuts
+GET  /api/srw_preview?path=                     → SRW heatmap + h/v cuts (requires srwpy)
 GET  /artifact/{p}/{v}/{fp}/{rest}              → raw artifact download
 WS   /ws                                        → run_changed / pipelines_changed
 ```
