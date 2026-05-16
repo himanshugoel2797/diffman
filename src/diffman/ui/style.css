@@ -96,13 +96,31 @@ button.ghost {
 .badge.unspecified { background: var(--err); }
 
 .stage-row {
-  display: grid; grid-template-columns: 140px 80px 1fr; gap: 8px;
+  display: grid; grid-template-columns: 140px 80px 1fr 120px; gap: 8px;
   padding: 6px 0; border-bottom: 1px solid #ddd; align-items: center;
 }
 .stage-row:last-child { border-bottom: 0; }
 .stage-row .name { font-weight: 600; }
 .stage-row .key { font-family: ui-monospace, Menlo, monospace;
                   font-size: 11px; color: #888; }
+.stage-bar {
+  position: relative; height: 18px; background: #f1f3f4;
+  border-radius: 3px; overflow: hidden;
+}
+.stage-bar-fill {
+  position: absolute; left: 0; top: 0; bottom: 0;
+  background: var(--info);
+}
+.stage-bar-fill.done    { background: var(--ok); }
+.stage-bar-fill.cached  { background: var(--info); }
+.stage-bar-fill.failed  { background: var(--err); }
+.stage-bar-fill.pending,
+.stage-bar-fill.skipped { background: var(--neutral); }
+.stage-bar-label {
+  position: relative; padding: 0 8px; font-size: 11px;
+  line-height: 18px; color: #333;
+}
+.compare-table tr.baseline-row { background: #eef5e0; font-weight: 600; }
 
 .artifact {
   border: 1px solid #ddd; border-radius: 4px;

@@ -249,9 +249,13 @@ on `--scan-root`) or when new runs appear (watcher on `--root`).
 ## CLI
 
 ```
-diffman scan [root]                 # discover pipeline modules
-diffman list <module>               # variant names registered by that module
-diffman describe <module> <variant> # resolved config + fingerprint
+diffman scan [root]                   # discover pipeline modules
+diffman list <module>                 # variant names registered by that module
+diffman describe <module> <variant>   # resolved config + fingerprint
+diffman chains                        # list every discovered chain
+diffman chain <name>                  # one chain's steps + variations (JSON)
+diffman progress <chain> <variation>  # per-step status from disk
+diffman scoreboard <chain> [-b VAR]   # variation × metric table; -b for deltas
 diffman serve [--root DIR] [--port N] [--scan-root DIR] [--bind ADDR]
 ```
 
@@ -274,7 +278,10 @@ GET  /api/chain/{name}                          → chain metadata + variations
 GET  /api/chain_progress/{name}/{variation}     → per-step status
 GET  /api/chain_source_diff?chain=<name>        → diff vs parent chain .py
 GET  /api/chain_variation_diff?chain=&variations=a,b  → per-step config diff
-GET  /api/scoreboard/{name}                     → variation × metric table
+GET  /api/chain_diff?chain=<name>               → variation diff vs parent chain
+GET  /api/scoreboard/{name}[?baseline=<var>]    → variation × metric table
+GET  /api/run_diff?pipeline=&variant=&a=&b=     → explain why two runs differ
+GET  /api/disk_usage                            → bytes per pipeline/variant/run
 GET  /api/runs                                  → all run records
 GET  /api/run/{p}/{v}/{fp}                      → single run + stages
 GET  /api/stage/{p}/{v}/{fp}/{stage}            → stage detail + artifacts

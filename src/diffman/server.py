@@ -28,7 +28,10 @@ Routes:
   GET  /api/chain_progress/{name}/{variation}     → per-step status of a variation
   GET  /api/chain_source_diff?chain=<name>        → diff vs parent chain .py
   GET  /api/chain_variation_diff?chain=&variations=a,b  → per-step config diff
-  GET  /api/scoreboard/{name}                     → variation × metric table
+  GET  /api/chain_diff?chain=<name>               → variation diff vs parent chain
+  GET  /api/scoreboard/{name}[?baseline=<var>]    → variation × metric table
+  GET  /api/run_diff?pipeline=&variant=&a=&b=     → explain why two runs differ
+  GET  /api/disk_usage                            → bytes per pipeline/variant/run
   GET  /artifact/{pipeline}/{variant}/{fp}/{rest} → raw file download
   WS   /ws                                        → push updates (run_changed)
 """
@@ -754,6 +757,7 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
             except Exception as e:
                 mapping, err = dict(v.overrides), str(e)
             variations.append({'name': v.name, 'base': v.base,
+                               'forks_of': v.forks_of,
                                'overrides': dict(v.overrides),
                                'mapping': mapping, 'error': err})
         return {**_chain_meta(chain), 'variations': variations}
@@ -823,6 +827,77 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
                 'parent_path': parent_path, 'child_path': child_path,
                 'diff': unified}
 
+    @app.get('/api/chain_diff')
+    def _chain_diff(chain: str):
+        """Match each variation in `chain` to its counterpart in the
+        parent chain (by `forks_of=` first, then by exact name) and
+        report which step→variant mappings differ.
+
+        Entries: 'matches' / 'differs' / 'only_in_child' / 'only_in_parent'.
+        Mirrors /api/diff's shape so the UI can render both with one
+        component.
+        """
+        ch, _ = _load_chain(chain)
+        if not ch.parent:
+            return {'chain': chain, 'parent': None,
+                    'variations': [{'variation': v.name,
+                                    'mapping': v.resolve(),
+                                    'kind': 'no_parent'}
+                                   for v in ch.variations.values()]}
+        parent_ch, _ = _load_chain(ch.parent)
+        child_names = set(ch.variations)
+        parent_names = set(parent_ch.variations)
+        #Build child→parent mapping, surfacing unresolved forks_of typos
+        #the way /api/diff does for variants.
+        c_to_p: dict[str, Optional[str]] = {}
+        unresolved: dict[str, str] = {}
+        for cn, cv in ch.variations.items():
+            if cv.forks_of:
+                if cv.forks_of in parent_names:
+                    c_to_p[cn] = cv.forks_of
+                else:
+                    c_to_p[cn] = None
+                    unresolved[cn] = cv.forks_of
+            elif cn in parent_names:
+                c_to_p[cn] = cn
+            else:
+                c_to_p[cn] = None
+        matched_parent = {p for p in c_to_p.values() if p}
+
+        out = []
+        for cn in sorted(child_names):
+            cv = ch.variations[cn]
+            try:
+                c_map = cv.resolve()
+            except Exception as e:
+                out.append({'variation': cn, 'kind': 'unresolved',
+                            'error': str(e)})
+                continue
+            entry: dict = {'variation': cn, 'mapping': c_map,
+                           'base': cv.base}
+            if cn in unresolved:
+                entry['forks_of_unresolved'] = unresolved[cn]
+            pn = c_to_p[cn]
+            if pn is None:
+                entry['kind'] = 'only_in_child'
+                out.append(entry); continue
+            try:
+                p_map = parent_ch.variations[pn].resolve()
+            except Exception:
+                p_map = dict(parent_ch.variations[pn].overrides)
+            entry['parent_variation'] = pn if pn != cn else None
+            step_diffs = [
+                {'step': step, 'parent': p_map.get(step),
+                 'child': c_map.get(step)}
+                for step in sorted(set(c_map) | set(p_map))
+                if c_map.get(step) != p_map.get(step)]
+            entry['kind'] = 'matches' if not step_diffs else 'differs'
+            entry['steps'] = step_diffs
+            out.append(entry)
+        for pn in sorted(parent_names - matched_parent):
+            out.append({'variation': pn, 'kind': 'only_in_parent'})
+        return {'chain': chain, 'parent': ch.parent, 'variations': out}
+
     @app.get('/api/chain_variation_diff')
     def _chain_variation_diff(chain: str, variations: str):
         """N-way per-step parameter diff across variations of a chain.
@@ -875,12 +950,20 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
         return {'chain': chain, 'variations': var_names, 'steps': sections}
 
     @app.get('/api/scoreboard/{name}')
-    def _scoreboard(name: str):
+    def _scoreboard(name: str, baseline: Optional[str] = None):
         """Cross-variation scoreboard. One row per chain variation, one
         column per metric key (``<step>.<stage>.<name>``) written via
         ``ctx.metric()``.
+
+        When `baseline=<variation>` is set, each row also carries a
+        `deltas` dict with ``value - baseline_value`` for numeric metrics
+        and ``None`` for non-numeric / missing-in-baseline keys.
         """
         chain, _ = _load_chain(name)
+        if baseline is not None and baseline not in chain.variations:
+            raise HTTPException(
+                status_code=404,
+                detail=f'baseline variation {baseline!r} not in chain {name!r}')
         all_runs = app.state.registry.list_runs()
         rows = []
         all_metric_keys: set[str] = set()
@@ -900,7 +983,18 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
                         flat[key] = v
                         all_metric_keys.add(key)
             rows.append({'variation': var_name, 'metrics': flat})
-        return {'chain': name,
+
+        if baseline is not None:
+            base_row = next((r for r in rows if r['variation'] == baseline), {})
+            base_metrics = base_row.get('metrics', {})
+            for row in rows:
+                row['deltas'] = {
+                    k: (row['metrics'][k] - base_metrics[k]
+                        if isinstance(row['metrics'].get(k), (int, float))
+                        and isinstance(base_metrics.get(k), (int, float))
+                        else None)
+                    for k in row['metrics']}
+        return {'chain': name, 'baseline': baseline,
                 'metric_keys': sorted(all_metric_keys),
                 'rows': rows}
 
@@ -932,6 +1026,99 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
             cfg = json.loads(Path(cfg_path).read_text())
         return {'run': match.__dict__, 'config': cfg,
                 'stages': _stage_summaries(match)}
+
+    @app.get('/api/disk_usage')
+    def _disk_usage():
+        """Bytes-on-disk rollup of the runs root, grouped by
+        (pipeline, variant, run). The UI uses this to decide what's safe
+        to clean. Pure observation — no deletion happens here.
+
+        Symlinks are followed for size attribution unless they loop or
+        break, in which case the broken/loop entry contributes 0 bytes.
+        """
+        root = app.state.registry.root
+        if not os.path.isdir(root):
+            return {'root': root, 'total': 0, 'pipelines': []}
+        pipelines = []
+        grand_total = 0
+        for pipeline in sorted(os.listdir(root)):
+            ppath = os.path.join(root, pipeline)
+            #_scripts/ holds the per-run git snapshot repo and isn't a
+            #pipeline directory; skip it. Anything else, even if its
+            #name starts with `_`, is a real pipeline.
+            if not os.path.isdir(ppath) or pipeline == '_scripts':
+                continue
+            variants = []
+            ptotal = 0
+            for variant in sorted(os.listdir(ppath)):
+                vpath = os.path.join(ppath, variant)
+                if not os.path.isdir(vpath):
+                    continue
+                runs = []
+                vtotal = 0
+                for short_fp in sorted(os.listdir(vpath)):
+                    rpath = os.path.join(vpath, short_fp)
+                    if not os.path.isdir(rpath):
+                        continue
+                    size = _du(rpath)
+                    runs.append({'short_fp': short_fp, 'size': size})
+                    vtotal += size
+                variants.append({'variant': variant, 'size': vtotal, 'runs': runs})
+                ptotal += vtotal
+            pipelines.append({'pipeline': pipeline, 'size': ptotal,
+                              'variants': variants})
+            grand_total += ptotal
+        return {'root': root, 'total': grand_total, 'pipelines': pipelines}
+
+    @app.get('/api/run_diff')
+    def _run_diff(pipeline: str, variant: str, a: str, b: str):
+        """Explain why two runs of the same (pipeline, variant) differ.
+
+        For each stage, report whether its cache key matches across runs.
+        For stages that differ, attribute the change to one or more of:
+        the function source, the config-keys slice, or any upstream
+        stage's key. Per-key config diffs are surfaced so the reader
+        can see *what* changed without re-running anything.
+        """
+        runs = app.state.registry.list_runs(pipeline=pipeline, variant=variant)
+        ra = next((r for r in runs if r.fingerprint.startswith(a)), None)
+        rb = next((r for r in runs if r.fingerprint.startswith(b)), None)
+        if ra is None or rb is None:
+            raise HTTPException(status_code=404,
+                                detail='one or both runs not found')
+        if ra.fingerprint == rb.fingerprint:
+            raise HTTPException(status_code=400,
+                                detail='cannot diff a run against itself')
+        stages = []
+        for st_name in sorted(set(ra.stage_keys) | set(rb.stage_keys)):
+            ka = ra.stage_keys.get(st_name)
+            kb = rb.stage_keys.get(st_name)
+            entry: dict = {'name': st_name, 'key_a': ka, 'key_b': kb,
+                           'identical': ka == kb}
+            if ka == kb:
+                stages.append(entry); continue
+            ma = _read_stage_meta(ra.fdir, st_name).get('components', {})
+            mb = _read_stage_meta(rb.fdir, st_name).get('components', {})
+            entry['fn_changed'] = ma.get('fn') != mb.get('fn')
+            entry['config_changed'] = ma.get('config') != mb.get('config')
+            entry['upstream_changed'] = ma.get('upstream') != mb.get('upstream')
+            entry['config_diff'] = diff_configs(
+                ma.get('config') or {}, mb.get('config') or {})
+            entry['upstream_diff'] = [
+                {'name': name, 'a': ma.get('upstream', {}).get(name),
+                 'b': mb.get('upstream', {}).get(name)}
+                for name in sorted(set((ma.get('upstream') or {}))
+                                   | set((mb.get('upstream') or {})))
+                if (ma.get('upstream') or {}).get(name)
+                   != (mb.get('upstream') or {}).get(name)
+            ]
+            stages.append(entry)
+        return {'pipeline': pipeline, 'variant': variant,
+                'run_a': {'fingerprint': ra.fingerprint,
+                          'short_fp': ra.fingerprint[:12]},
+                'run_b': {'fingerprint': rb.fingerprint,
+                          'short_fp': rb.fingerprint[:12]},
+                'stages': stages}
 
     @app.get('/api/stage/{pipeline}/{variant}/{short_fp}/{stage}')
     def _stage_detail(pipeline: str, variant: str, short_fp: str, stage: str):
@@ -1044,6 +1231,31 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
     return app
 
 
+def _du(path: str) -> int:
+    """Bytes on disk under `path`, following symlinks to real files.
+
+    Loop or broken symlinks contribute 0 — they're surfaced rather than
+    crashing the whole walk. Used by /api/disk_usage; not a stable API.
+    """
+    total = 0
+    for root, _, files in os.walk(path, followlinks=False):
+        for f in files:
+            full = os.path.join(root, f)
+            try:
+                total += os.stat(full).st_size
+            except OSError:
+                continue
+    return total
+
+
+def _read_stage_meta(fdir: str, st_name: str) -> dict:
+    """Return _meta.json for a stage, or an empty dict if missing/bad."""
+    try:
+        return json.loads(Path(fdir, 'stages', st_name, '_meta.json').read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
 def _stage_summaries(record) -> list[dict]:
     out = []
     stages_dir = os.path.join(record.fdir, 'stages')
@@ -1051,17 +1263,18 @@ def _stage_summaries(record) -> list[dict]:
         return out
     for st_name in sorted(os.listdir(stages_dir)):
         outs = os.path.join(stages_dir, st_name, 'outputs')
-        artifacts = []
-        if os.path.isdir(outs):
-            for root, _, files in os.walk(outs):
-                for fn in files:
-                    artifacts.append(os.path.relpath(
-                        os.path.join(root, fn), record.fdir))
+        artifacts = sum(len(fs) for _, _, fs in os.walk(outs)) \
+            if os.path.isdir(outs) else 0
+        meta = _read_stage_meta(record.fdir, st_name)
+        started, ended = meta.get('started'), meta.get('ended')
         out.append({
             'name': st_name,
             'status': record.stage_status.get(st_name),
             'key': record.stage_keys.get(st_name),
-            'artifact_count': len(artifacts),
+            'artifact_count': artifacts,
+            'started': started,
+            'ended': ended,
+            'duration_s': (ended - started) if (started and ended) else None,
         })
     return out
 
@@ -1189,6 +1402,20 @@ def _array_diff(a, b, target_max: int, paths) -> dict:
         from . import srw_loaders
         delta_ds, _ = srw_loaders.downsample(d, target_max)
         meta['delta_heatmap'] = delta_ds.tolist()
+    elif d.ndim == 1:
+        #1-D arrays overlay much better than they summarize. Downsample
+        #to `target_max` so a 5e6-point trace doesn't ship megabytes of
+        #JSON; the x axis is the original index so the reader can spot
+        #where a divergence happens, not the decimated index.
+        n = a.size
+        stride = max(1, n // target_max)
+        idx = list(range(0, n, stride))
+        meta['overlay'] = {
+            'x':   idx,
+            'y_a': a[::stride].astype(float).tolist(),
+            'y_b': b[::stride].astype(float).tolist(),
+            'stride': stride,
+        }
     return meta
 
 

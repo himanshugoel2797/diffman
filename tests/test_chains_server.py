@@ -624,6 +624,146 @@ class TestScoreboardEdges:
 # /api/chains: a module that fails to import is tolerated
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Feature: baseline-relative scoreboard
+# ---------------------------------------------------------------------------
+
+class TestScoreboardBaseline:
+    def test_baseline_adds_per_metric_deltas(self, chain_client, scan_root):
+        c, _ = chain_client
+        discovery.load_module('_diffman_chain_parent')
+        mod = sys.modules['_diffman_chain_parent']
+        rr = dm.RunRegistry(root=str(scan_root / 'runs'))
+        mod.CHAIN.variations['baseline'].run(rr)
+        mod.CHAIN.variations['jittered'].run(rr)
+        d = c.get('/api/scoreboard/mychain?baseline=baseline').json()
+        assert d['baseline'] == 'baseline'
+        rows = {r['variation']: r for r in d['rows']}
+        #baseline.flux=10, jittered.flux=20 → delta=+10.
+        assert rows['jittered']['deltas']['forward.sim.flux'] == 10
+        #recon.iters is identical (100, 100) → delta=0.
+        assert rows['jittered']['deltas']['recon.recon.iters_done'] == 0
+        #The baseline row has zeros for its own deltas (vs itself).
+        assert rows['baseline']['deltas']['forward.sim.flux'] == 0
+
+    def test_baseline_delta_is_none_for_missing_or_non_numeric(
+            self, chain_client, scan_root):
+        c, _ = chain_client
+        discovery.load_module('_diffman_chain_parent')
+        mod = sys.modules['_diffman_chain_parent']
+        rr = dm.RunRegistry(root=str(scan_root / 'runs'))
+        #Only baseline runs; jittered has no metrics at all. Its row must
+        #have None for every delta — not a crash.
+        mod.CHAIN.variations['baseline'].run(rr)
+        d = c.get('/api/scoreboard/mychain?baseline=baseline').json()
+        rows = {r['variation']: r for r in d['rows']}
+        assert all(v is None for v in rows['jittered']['deltas'].values()) \
+            or rows['jittered']['deltas'] == {}
+
+    def test_baseline_unknown_variation_404(self, chain_client):
+        c, _ = chain_client
+        r = c.get('/api/scoreboard/mychain?baseline=ghost')
+        assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Feature: forks_of for chain variations + /api/chain_diff
+# ---------------------------------------------------------------------------
+
+CHAIN_PARENT_FOR_DIFF = """
+    import diffman as dm
+    import _diffman_chain_fwd as forward_mod
+    import _diffman_chain_recon as recon_mod
+    CHAIN = dm.Chain('orig', steps=[
+        dm.ChainStep('forward', forward_mod.PIPELINE),
+        dm.ChainStep('recon',   recon_mod.PIPELINE, consumes=('forward',)),
+    ])
+    CHAIN.variation('baseline',  forward='base',   recon='ePIE')
+    CHAIN.variation('algo_dm',   base='baseline', recon='DM')
+"""
+
+CHAIN_CHILD_FOR_DIFF = """
+    import diffman as dm
+    import _diffman_chain_fwd as forward_mod
+    import _diffman_chain_recon as recon_mod
+    CHAIN = dm.Chain('orig_v2', parent='orig', steps=[
+        dm.ChainStep('forward', forward_mod.PIPELINE),
+        dm.ChainStep('recon',   recon_mod.PIPELINE, consumes=('forward',)),
+    ])
+    #Renamed: baseline_v2 IS the parent's `baseline`.
+    CHAIN.variation('baseline_v2', forks_of='baseline',
+                    forward='jitter', recon='ePIE')
+    #Brand-new variation, only in this fork.
+    CHAIN.variation('experimental', forward='base', recon='DM')
+    #Typo'd forks_of — must be surfaced, not silently swallowed.
+    CHAIN.variation('typoed', forks_of='not_a_real_variation',
+                    forward='base', recon='ePIE')
+"""
+
+
+@pytest.fixture
+def fork_diff_client(scan_root, make_pipeline):
+    make_pipeline('_diffman_chain_fwd',    PIPELINE_FORWARD)
+    make_pipeline('_diffman_chain_recon',  PIPELINE_RECON)
+    make_pipeline('_diffman_chain_origp',  CHAIN_PARENT_FOR_DIFF)
+    make_pipeline('_diffman_chain_origc',  CHAIN_CHILD_FOR_DIFF)
+    app = create_app(root=str(scan_root / 'runs'),
+                     scan_root=str(scan_root), no_scan=False)
+    with TestClient(app) as c:
+        c.get('/api/chains')   #force the load sweep
+        yield c, scan_root
+
+
+class TestChainDiff:
+    def test_chain_diff_matches_variations_by_forks_of(self, fork_diff_client):
+        c, _ = fork_diff_client
+        d = c.get('/api/chain_diff?chain=orig_v2').json()
+        assert d['parent'] == 'orig'
+        by_name = {v['variation']: v for v in d['variations']}
+        bv2 = by_name['baseline_v2']
+        assert bv2['parent_variation'] == 'baseline'
+        #The renamed variation flips forward from base → jitter.
+        assert bv2['kind'] == 'differs'
+        step_changes = {s['step']: s for s in bv2['steps']}
+        assert step_changes['forward']['parent'] == 'base'
+        assert step_changes['forward']['child']  == 'jitter'
+        #The recon step is unchanged (ePIE in both).
+        assert 'recon' not in step_changes
+
+    def test_chain_diff_flags_unresolved_forks_of(self, fork_diff_client):
+        c, _ = fork_diff_client
+        d = c.get('/api/chain_diff?chain=orig_v2').json()
+        by_name = {v['variation']: v for v in d['variations']}
+        assert by_name['typoed']['forks_of_unresolved'] == 'not_a_real_variation'
+        assert by_name['typoed']['kind'] == 'only_in_child'
+
+    def test_chain_diff_reports_only_in_child_and_only_in_parent(
+            self, fork_diff_client):
+        c, _ = fork_diff_client
+        d = c.get('/api/chain_diff?chain=orig_v2').json()
+        kinds = {v['variation']: v['kind'] for v in d['variations']}
+        assert kinds['experimental'] == 'only_in_child'
+        #The parent's `algo_dm` was not adopted by the child anywhere.
+        assert kinds['algo_dm'] == 'only_in_parent'
+
+    def test_chain_diff_for_root_chain_returns_no_parent_kind(
+            self, fork_diff_client):
+        c, _ = fork_diff_client
+        d = c.get('/api/chain_diff?chain=orig').json()
+        assert d['parent'] is None
+        kinds = {v['kind'] for v in d['variations']}
+        assert kinds == {'no_parent'}
+
+
+class TestVariationForksOfStored:
+    def test_chain_detail_surfaces_forks_of(self, fork_diff_client):
+        c, _ = fork_diff_client
+        d = c.get('/api/chain/orig_v2').json()
+        by_name = {v['name']: v for v in d['variations']}
+        assert by_name['baseline_v2']['forks_of'] == 'baseline'
+        assert by_name['experimental']['forks_of'] is None
+
+
 class TestChainsToleratesBrokenModule:
     def test_chains_endpoint_skips_modules_that_fail_to_import(
             self, scan_root, make_pipeline):

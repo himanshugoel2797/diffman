@@ -432,6 +432,9 @@ const App = {
       actions.appendChild(el('button', {class: 'ghost',
         text: 'Source diff vs parent',
         onclick: () => this.showChainSourceDiff(name)}));
+      actions.appendChild(el('button', {class: 'ghost',
+        text: 'Variation diff vs parent',
+        onclick: () => this.showChainDiff(name)}));
     }
     actions.appendChild(el('button', {class: 'ghost', text: 'Scoreboard',
       onclick: () => this.showScoreboard(name)}));
@@ -568,6 +571,50 @@ const App = {
     return wrap;
   },
 
+  async showChainDiff(name) {
+    const main = $('#main'); main.innerHTML = '';
+    main.appendChild(el('h2', {text: `Variation diff — ${name} vs parent chain`}));
+    let d;
+    try { d = await jget('/api/chain_diff?chain=' + encodeURIComponent(name)); }
+    catch (e) { main.appendChild(el('pre', {text: 'failed: ' + e})); return; }
+    if (!d.parent) {
+      main.appendChild(el('p', {class: 'hint', text: 'no parent chain'}));
+      return;
+    }
+    main.appendChild(el('p', {class: 'hint'}, ['parent: ',
+      el('a', {href: '#', text: d.parent,
+        onclick: ev => { ev.preventDefault(); this.showChain(d.parent); }})]));
+    for (const v of d.variations) {
+      const box = el('div', {class: 'diff-box'});
+      box.appendChild(el('div', {class: 'diff-variant-head'}, [
+        el('span', {class: 'diff-name', text: v.variation}),
+        el('span', {class: 'diff-kind ' + v.kind,
+          text: v.kind.replace(/_/g, ' ')}),
+      ]));
+      if (v.parent_variation) {
+        box.appendChild(el('p', {class: 'hint',
+          text: `matched parent's ${v.parent_variation}`}));
+      }
+      if (v.forks_of_unresolved) {
+        box.appendChild(el('p', {class: 'fork-orphan',
+          text: `forks_of='${v.forks_of_unresolved}' not in parent`}));
+      }
+      if (v.kind === 'differs' && v.steps) {
+        const tbl = el('table', {class: 'diff-table'});
+        tbl.appendChild(el('tr', {}, [el('th', {text: 'step'}),
+          el('th', {text: 'parent variant'}), el('th', {text: 'this variant'})]));
+        for (const s of v.steps) {
+          tbl.appendChild(el('tr', {class: 'diff-changed'}, [
+            el('td', {class: 'diff-key', text: s.step}),
+            el('td', {text: s.parent || '—'}),
+            el('td', {text: s.child || '—'})]));
+        }
+        box.appendChild(tbl);
+      }
+      main.appendChild(box);
+    }
+  },
+
   async showChainSourceDiff(name) {
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `Chain source diff — ${name} vs parent`}));
@@ -656,12 +703,27 @@ const App = {
       onclick: () => this.showChain(chainName)}));
   },
 
-  async showScoreboard(chainName) {
+  async showScoreboard(chainName, baseline) {
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `Scoreboard — ${chainName}`}));
+    const url = '/api/scoreboard/' + encodeURIComponent(chainName)
+      + (baseline ? '?baseline=' + encodeURIComponent(baseline) : '');
     let d;
-    try { d = await jget('/api/scoreboard/' + encodeURIComponent(chainName)); }
+    try { d = await jget(url); }
     catch (e) { main.appendChild(el('pre', {text: 'failed: ' + e})); return; }
+
+    //Baseline picker — null = absolute values, any variation = deltas.
+    const sel = el('select', {class: 'run-filter',
+      style: 'max-width:240px; margin:8px 0'});
+    sel.appendChild(el('option', {value: '', text: '(no baseline)'}));
+    for (const row of d.rows) {
+      sel.appendChild(el('option', {value: row.variation, text: row.variation}));
+    }
+    if (baseline) sel.value = baseline;
+    sel.onchange = () => this.showScoreboard(chainName, sel.value || null);
+    main.appendChild(el('div', {}, [
+      el('label', {text: 'baseline: '}), sel]));
+
     if (!d.metric_keys.length) {
       main.appendChild(el('p', {class: 'hint',
         text: '(no metrics recorded yet — stages call ctx.metric(stage, name, value) to populate this)'}));
@@ -671,10 +733,19 @@ const App = {
     for (const k of d.metric_keys) header.appendChild(el('th', {text: k}));
     tbl.appendChild(header);
     for (const row of d.rows) {
-      const tr = el('tr', {}, [el('td', {class: 'diff-key', text: row.variation})]);
+      const tr = el('tr', {class: row.variation === baseline ? 'baseline-row' : ''},
+        [el('td', {class: 'diff-key', text: row.variation})]);
       for (const k of d.metric_keys) {
         const v = row.metrics[k];
-        tr.appendChild(el('td', {text: v === undefined ? '—' : fmtVal(v)}));
+        const delta = row.deltas && row.deltas[k];
+        let txt;
+        if (v === undefined) txt = '—';
+        else if (baseline && row.variation !== baseline
+                 && typeof delta === 'number') {
+          const sign = delta >= 0 ? '+' : '';
+          txt = `${fmtVal(v)} (${sign}${fmt(delta)})`;
+        } else txt = fmtVal(v);
+        tr.appendChild(el('td', {text: txt}));
       }
       tbl.appendChild(tr);
     }
@@ -682,6 +753,43 @@ const App = {
     main.appendChild(el('button', {class: 'ghost', style: 'margin-top:12px',
       text: 'Back to chain',
       onclick: () => this.showChain(chainName)}));
+  },
+
+  async showDiskUsage() {
+    this.current = {kind: 'disk'};
+    const main = $('#main'); main.innerHTML = '';
+    main.appendChild(el('h2', {text: 'Disk usage'}));
+    let d;
+    try { d = await jget('/api/disk_usage'); }
+    catch (e) { main.appendChild(el('pre', {text: 'failed: ' + e})); return; }
+    main.appendChild(el('p', {class: 'hint',
+      text: `${d.root}  ·  total ${humanSize(d.total)}`}));
+    const tbl = el('table', {class: 'compare-table'});
+    tbl.appendChild(el('tr', {}, [
+      el('th', {text: 'pipeline'}), el('th', {text: 'variant'}),
+      el('th', {text: 'run'}), el('th', {text: 'size'})]));
+    for (const p of d.pipelines) {
+      tbl.appendChild(el('tr', {}, [
+        el('td', {class: 'diff-key', text: p.pipeline}),
+        el('td', {text: ''}), el('td', {text: ''}),
+        el('td', {text: humanSize(p.size)})]));
+      for (const v of p.variants) {
+        tbl.appendChild(el('tr', {}, [
+          el('td', {text: ''}),
+          el('td', {class: 'diff-key', text: v.variant}),
+          el('td', {text: ''}),
+          el('td', {text: humanSize(v.size)})]));
+        for (const r of v.runs) {
+          tbl.appendChild(el('tr', {}, [
+            el('td', {text: ''}), el('td', {text: ''}),
+            el('td', {text: r.short_fp,
+              onclick: () => this.showRun(p.pipeline, v.variant, r.short_fp),
+              style: 'cursor:pointer; color:var(--info)'}),
+            el('td', {text: humanSize(r.size)})]));
+        }
+      }
+    }
+    main.appendChild(tbl);
   },
 
   async find() {
@@ -735,12 +843,31 @@ const App = {
       ]));
     }
 
+    //"Why did this re-run vs ..." action.
+    main.appendChild(el('div', {class: 'row', style: 'margin:6px 0'}, [
+      el('button', {class: 'ghost', text: 'Why did this re-run vs…',
+        onclick: () => this.showWhyRerunPicker(pipeline, variant, short_fp)}),
+    ]));
+
+    //Stage list — now also shows duration when available, plus a tiny
+    //horizontal bar whose width is proportional to the longest stage.
+    const total = d.stages.reduce(
+      (m, s) => Math.max(m, s.duration_s || 0), 0);
     const stagesDiv = el('div');
     for (const s of d.stages) {
+      const pct = total > 0 && s.duration_s
+        ? Math.max(2, Math.round(100 * s.duration_s / total)) : 0;
       stagesDiv.appendChild(el('div', {class: 'stage-row'}, [
         el('span', {class: 'name', text: s.name}),
         el('span', {}, [el('span', {class: 'badge ' + (s.status || 'pending'),
                                     text: s.status || 'pending'})]),
+        el('span', {class: 'stage-bar'}, [
+          el('span', {class: 'stage-bar-fill ' + (s.status || 'pending'),
+                      style: `width:${pct}%`}),
+          el('span', {class: 'stage-bar-label',
+            text: s.duration_s != null
+              ? `${s.duration_s.toFixed(2)}s` : ''}),
+        ]),
         el('span', {}, [
           el('button', {class: 'ghost', text: `Inspect (${s.artifact_count})`,
                         onclick: () => this.showStage(pipeline, variant, short_fp, s.name)}),
@@ -751,6 +878,88 @@ const App = {
 
     main.appendChild(el('h3', {text: 'Config'}));
     main.appendChild(el('pre', {text: JSON.stringify(d.config, null, 2)}));
+  },
+
+  async showWhyRerunPicker(pipeline, variant, short_fp) {
+    //Show every other run of the same (pipeline, variant) tuple and let
+    //the user pick one to diff against. /api/run_diff explains where the
+    //stage cache keys diverged.
+    const runs = (await jget('/api/runs?pipeline=' + encodeURIComponent(pipeline)
+      + '&variant=' + encodeURIComponent(variant))).runs;
+    const others = runs.filter(r => r.short_fp !== short_fp);
+    const main = $('#main'); main.innerHTML = '';
+    main.appendChild(el('h2', {text: `Why did this re-run? — ${pipeline} / ${variant}`}));
+    main.appendChild(el('p', {class: 'hint',
+      text: 'Pick another run of the same pipeline+variant to compare ' +
+            'stage cache keys.'}));
+    if (!others.length) {
+      main.appendChild(el('p', {class: 'hint',
+        text: '(no other runs of this pipeline/variant exist yet)'}));
+      return;
+    }
+    const list = el('div', {class: 'variant-list'});
+    for (const r of others) {
+      list.appendChild(el('a', {href: '#',
+        text: `${r.short_fp}  ${r.started || ''}`,
+        onclick: ev => { ev.preventDefault();
+          this.showRunDiff(pipeline, variant, short_fp, r.short_fp); }}));
+    }
+    main.appendChild(list);
+  },
+
+  async showRunDiff(pipeline, variant, a, b) {
+    const main = $('#main'); main.innerHTML = '';
+    main.appendChild(el('h2',
+      {text: `Run diff — ${pipeline}/${variant}  ${a} vs ${b}`}));
+    let d;
+    try {
+      d = await jget('/api/run_diff?' + new URLSearchParams({
+        pipeline, variant, a, b}));
+    } catch (e) { main.appendChild(el('pre', {text: 'failed: ' + e})); return; }
+    for (const st of d.stages) {
+      const box = el('div', {class: 'diff-box'});
+      const head = el('div', {class: 'diff-variant-head'}, [
+        el('span', {class: 'diff-name', text: st.name}),
+        el('span', {class: 'diff-kind ' + (st.identical ? 'matches' : 'differs'),
+          text: st.identical ? 'identical' : 'differs'}),
+      ]);
+      box.appendChild(head);
+      if (!st.identical) {
+        const flags = [];
+        if (st.fn_changed) flags.push('fn');
+        if (st.config_changed) flags.push('config');
+        if (st.upstream_changed) flags.push('upstream');
+        box.appendChild(el('p', {class: 'hint',
+          text: 'changed: ' + flags.join(', ')}));
+        if (st.config_diff && st.config_diff.length) {
+          const tbl = el('table', {class: 'diff-table'});
+          tbl.appendChild(el('tr', {}, [
+            el('th', {text: 'key'}),
+            el('th', {text: a}), el('th', {text: b})]));
+          for (const e of st.config_diff) {
+            tbl.appendChild(el('tr', {class: 'diff-' + e.kind}, [
+              el('td', {class: 'diff-key', text: e.path}),
+              el('td', {text: e.kind === 'added' ? '—' : fmtVal(e.parent)}),
+              el('td', {text: e.kind === 'removed' ? '—' : fmtVal(e.child)})]));
+          }
+          box.appendChild(tbl);
+        }
+        if (st.upstream_diff && st.upstream_diff.length) {
+          const tbl = el('table', {class: 'diff-table'});
+          tbl.appendChild(el('tr', {}, [
+            el('th', {text: 'upstream stage'}),
+            el('th', {text: a}), el('th', {text: b})]));
+          for (const u of st.upstream_diff) {
+            tbl.appendChild(el('tr', {class: 'diff-changed'}, [
+              el('td', {class: 'diff-key', text: u.name}),
+              el('td', {text: (u.a || '').slice(0,12)}),
+              el('td', {text: (u.b || '').slice(0,12)})]));
+          }
+          box.appendChild(tbl);
+        }
+      }
+      main.appendChild(box);
+    }
   },
 
   async showStage(pipeline, variant, short_fp, stage) {
@@ -971,6 +1180,18 @@ const App = {
           ]));
         }
         main.appendChild(tbl);
+      }
+      if (r.overlay) {
+        const div = el('div', {class: 'plot'});
+        main.appendChild(div);
+        Plotly.newPlot(div, [
+          {x: r.overlay.x, y: r.overlay.y_a, type: 'scatter',
+           mode: 'lines', name: 'a'},
+          {x: r.overlay.x, y: r.overlay.y_b, type: 'scatter',
+           mode: 'lines', name: 'b'},
+        ], {margin: {t: 30, l: 40, r: 20, b: 30},
+            title: 'overlay (b on a)' +
+              (r.overlay.stride > 1 ? `  · stride ${r.overlay.stride}` : '')});
       }
       if (r.delta_heatmap) {
         const div = el('div', {class: 'plot'});

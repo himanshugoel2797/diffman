@@ -255,16 +255,23 @@ class Stage:
     inputs: tuple = ()
     config_keys: tuple = ()
 
-    def key(self, variant: Variant, upstream_keys: dict) -> str:
+    def key_components(self, variant: Variant,
+                       upstream_keys: dict) -> dict:
+        """The three inputs to this stage's cache key, returned as a dict
+        so the run-diff endpoint can attribute a re-execution to a
+        changed fn / config / upstream rather than just "key flipped"."""
         cfg = variant.config
         if self.config_keys:
             cfg = {k: cfg[k] for k in self.config_keys if k in cfg}
-        return fingerprint({
-            'stage': self.name,
+        return {
             'fn': _fn_source_hash(self.fn),
-            'config': cfg,
+            'config': dict(cfg),
             'upstream': {k: upstream_keys[k] for k in self.inputs},
-        })
+        }
+
+    def key(self, variant: Variant, upstream_keys: dict) -> str:
+        return fingerprint({'stage': self.name,
+                            **self.key_components(variant, upstream_keys)})
 
 
 class Pipeline:
@@ -312,7 +319,8 @@ class Pipeline:
 
         upstream_keys: dict[str, str] = {}
         for stage in self.stages:
-            key = stage.key(variant, upstream_keys)
+            components = stage.key_components(variant, upstream_keys)
+            key = fingerprint({'stage': stage.name, **components})
             ctx.record.stage_keys[stage.name] = key
             upstream_keys[stage.name] = key
 
@@ -333,9 +341,13 @@ class Pipeline:
             t0 = time.time()
             try:
                 stage.fn(ctx)
+                #_meta.json records both the terminal key AND its three
+                #inputs (fn / config / upstream) so /api/run_diff can
+                #attribute a cache miss to which input changed.
                 (stage_dir / '_meta.json').write_text(json.dumps(
                     {'name': stage.name, 'key': key,
-                     'started': t0, 'ended': time.time()}, indent=2))
+                     'started': t0, 'ended': time.time(),
+                     'components': components}, indent=2, default=str))
                 #Mark done and persist BEFORE writing `_key`, so a crash
                 #between the two leaves the stage looking incomplete
                 #(re-runnable) rather than cached-but-`running`.
@@ -396,15 +408,23 @@ class Variation:
     keyword overrides replace individual entries. Two variations that
     happen to share a step's variant choice also share the corresponding
     run directory on disk (fingerprint caching).
+
+    ``forks_of`` declares that this variation is the renamed descendant
+    of a variation in the parent chain. /api/chain_diff uses it to line
+    up cross-fork comparisons when variation names changed, mirroring
+    `forks_of` on `Variant`.
     """
 
-    __slots__ = ('chain', 'name', 'base', 'overrides')
+    __slots__ = ('chain', 'name', 'base', 'forks_of', 'overrides')
 
     def __init__(self, chain: 'Chain', name: str, *,
-                 base: Optional[str] = None, **mapping):
+                 base: Optional[str] = None,
+                 forks_of: Optional[str] = None,
+                 **mapping):
         self.chain = chain
         self.name = name
         self.base = base
+        self.forks_of = forks_of
         self.overrides = mapping
 
     def resolve(self) -> dict:
@@ -461,11 +481,12 @@ class Chain:
             seen.add(s.name)
 
     def variation(self, name: str, *, base: Optional[str] = None,
+                  forks_of: Optional[str] = None,
                   **mapping) -> Variation:
         if name in self.variations:
             raise ValueError(
                 f'variation {name!r} already defined in chain {self.name!r}')
-        v = Variation(self, name, base=base, **mapping)
+        v = Variation(self, name, base=base, forks_of=forks_of, **mapping)
         self.variations[name] = v
         return v
 
