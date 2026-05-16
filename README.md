@@ -244,7 +244,15 @@ aggregates them across all of a chain's variations into one table.
   a `short_fp` back to its variant and runs.
 
 The UI auto-refreshes when you edit a pipeline `.py` (filesystem watcher
-on `--scan-root`) or when new runs appear (watcher on `--root`).
+on `--scan-root`) or when new runs appear (watcher on `--root`). A small
+dot next to the **diffman** title in the sidebar reflects the WebSocket
+state — green for connected, red for transport errors, grey while
+reconnecting.
+
+Every drill-in page (variant, stage, source diff, run diff, compare,
+why-re-run picker) carries a back link beneath its heading, since the
+UI has no URL routing and the sidebar only navigates between top-level
+pipelines, chains, and runs.
 
 ## CLI
 

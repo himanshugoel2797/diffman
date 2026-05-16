@@ -151,6 +151,32 @@ matching branch in `App.renderArtifact()` in
 [src/diffman/ui/app.js](src/diffman/ui/app.js). Optional deps (h5py,
 plotly) must be import-guarded.
 
+### A new UI page / view
+
+The UI is a single-page app rooted at `App` in
+[src/diffman/ui/app.js](src/diffman/ui/app.js). New views are methods on
+`App` that clear `#main` and append the content. A few conventions hold
+across them:
+
+- Set `this.current = {kind: '<page>', ...identifiers}` at the top of
+  every entry-point method. The sidebar's auto-refresh consults
+  `this.current` to keep the active highlight in sync, and
+  `handleRunChanged` uses it to decide whether a websocket event should
+  re-render the current page.
+- Include a back link as the first element after the `<h2>` heading
+  when the view was reached from another page (variant → pipeline,
+  stage → run, source-diff → pipeline, etc.). The UI has no URL
+  routing, so without an explicit back link the user is stranded.
+- Build DOM with the `el(tag, props, kids)` helper. It treats `class`,
+  `onclick`, `html`, `text` specially; everything else is a flat
+  attribute. **Null / undefined values in `props` are skipped** — so
+  `title: maybeNull` is safe — and boolean values are set as HTML
+  attribute presence (so `disabled: true` works, `disabled: false`
+  omits the attribute).
+- Numeric formatting goes through `fmt()` (smart sci/precision with
+  0 / NaN / Infinity special-cased) and `fmtVal()` (everything else,
+  falling back to `JSON.stringify`).
+
 ## Conventions
 
 - **Type hints on the public surface.** Internal helpers can skip.
@@ -181,6 +207,12 @@ plotly) must be import-guarded.
 - **Variant lookup is module-qualified**: use `registry.get(module, name)`
   internally; `registry.get_any(name)` works only when exactly one module
   has registered that name and raises otherwise.
+- **`/api/artifact_diff` JSON has two response shapes**: when both
+  files parse to dicts, the server returns `{kind: 'json_diff',
+  entries: [...]}` (a list of `diff_configs` entries). For arrays /
+  primitives / `null`, it returns `{kind: 'json_diff', a, b, equal}`
+  instead. `renderArtifactDiff` in the UI handles both — don't drop
+  the `else` branch if you refactor.
 - **Two diffman codebases**: changes to core semantics should usually
   land in BOTH this package and
   [srwl_uti_diffman.py](../xpp_nnl_dataset_gpu/smp_to_det/SRW/env/python/srwpy/srwl_uti_diffman.py).
