@@ -206,12 +206,8 @@ class TestFind:
 
 
 class TestArtifactDiff:
-    def test_array_diff_reports_stats_and_heatmap(self, client, tmp_path):
+    def test_array_diff_reports_stats_and_heatmap(self, client):
         c, scan_root = client
-        a = tmp_path / 'a.npy'; np.save(a, np.zeros((4, 5)))
-        b = tmp_path / 'b.npy'; np.save(b, np.ones((4, 5)))
-        #Both paths must resolve under the runs root; tmp_path is not, so
-        #write them under the registry root explicitly.
         runs = scan_root / 'runs'
         runs.mkdir(exist_ok=True)
         a = runs / 'a.npy'; np.save(a, np.zeros((4, 5)))

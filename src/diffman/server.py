@@ -98,14 +98,22 @@ def diff_configs(parent: dict, child: dict, path: str = '') -> list[dict]:
 # Pipeline-forest construction
 # ---------------------------------------------------------------------------
 
-def _pipeline_meta(module: str) -> dict:
-    """Import a discovered module and report its pipeline metadata."""
+def _pipeline_meta(module: str) -> Optional[dict]:
+    """Import a discovered module and report its pipeline metadata.
+
+    Returns None if the module is chain-only (declares CHAIN/CHAINS but
+    no PIPELINE), so the pipeline forest doesn't surface a misleading
+    "no PIPELINE attribute" error for a module that wasn't meant to
+    declare one.
+    """
     try:
         mod = discovery.load_module(module)
     except Exception as e:
         return {'module': module, 'error': f'import failed: {e}'}
     pipe = getattr(mod, 'PIPELINE', None)
     if pipe is None:
+        if getattr(mod, 'CHAIN', None) is not None or getattr(mod, 'CHAINS', None):
+            return None
         return {'module': module, 'error': 'no PIPELINE attribute'}
     return {
         'module': module,
@@ -414,8 +422,9 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
     @app.get('/api/pipelines')
     def _pipelines():
         """Return the fork forest: roots → children, plus any orphans."""
-        metas = [_pipeline_meta(m['module'])
-                 for m in discovery.DISCOVERED_LIST]
+        metas = [m for m in (_pipeline_meta(d['module'])
+                             for d in discovery.DISCOVERED_LIST)
+                 if m is not None]
         return {
             'scan_root': os.path.abspath(app.state.scan_root),
             'forest': _build_forest(metas),

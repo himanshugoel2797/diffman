@@ -229,22 +229,69 @@ class TestChainProgress:
         statuses = {s['name']: s['status'] for s in d['steps']}
         assert statuses == {'forward': 'cached', 'recon': 'cached'}
 
-    def test_progress_distinguishes_variations_by_upstream(
+    def test_progress_does_not_misattribute_sibling_recon_run(
             self, chain_client, scan_root):
+        """The critical correctness property: when baseline.recon ran with
+        upstream={forward: base_fp} and jittered.forward later ran on its
+        own, asking for jittered's progress must NOT report jittered.recon
+        as done — that recon=ePIE run's upstream fingerprint doesn't match
+        jittered's forward fingerprint, even though the variant name does.
+        """
+        c, _ = chain_client
+        discovery.load_module('_diffman_chain_parent')
+        discovery.load_module('_diffman_chain_fwd')
+        mod = sys.modules['_diffman_chain_parent']
+        fwd_mod = sys.modules['_diffman_chain_fwd']
+        rr = dm.RunRegistry(root=str(scan_root / 'runs'))
+        #Run baseline fully: forward=base AND recon=ePIE+upstream=base_fp.
+        baseline_runs = mod.CHAIN.variations['baseline'].run(rr)
+        #Manually create JUST forward=jitter so the cascading-pending
+        #short-circuit doesn't hide the upstream-fp join we want to test.
+        jitter_variant = dm.registry.get('_diffman_chain_fwd', 'jitter')
+        fwd_jitter = fwd_mod.PIPELINE.run(jitter_variant, rr)
+        d = c.get('/api/chain_progress/mychain/jittered').json()
+        steps = {s['name']: s for s in d['steps']}
+        #forward must be done — the run we just made exists.
+        assert steps['forward']['status'] in ('done', 'cached')
+        assert steps['forward']['fingerprint'] == fwd_jitter.fingerprint
+        #recon must be pending — the only recon=ePIE run's upstream points
+        #at forward=base, not forward=jitter.
+        assert steps['recon']['status'] == 'pending'
+        assert steps['recon']['fingerprint'] is None
+        #Sanity: baseline still shows recon=done (proves the recon run
+        #from earlier is being correctly attributed when upstream DOES match).
+        d2 = c.get('/api/chain_progress/mychain/baseline').json()
+        baseline_recon = {s['name']: s for s in d2['steps']}['recon']
+        assert baseline_recon['status'] in ('done', 'cached')
+        assert baseline_recon['fingerprint'] == baseline_runs['recon'].fingerprint
+
+    def test_progress_reports_mixed_when_some_stages_not_terminal(
+            self, chain_client, scan_root):
+        """A run whose stages have a mix of statuses (e.g. one done,
+        another still running because the process crashed mid-flush)
+        must surface as 'mixed' so the UI can flag it for inspection."""
         c, _ = chain_client
         discovery.load_module('_diffman_chain_parent')
         mod = sys.modules['_diffman_chain_parent']
         rr = dm.RunRegistry(root=str(scan_root / 'runs'))
-        mod.CHAIN.variations['baseline'].run(rr)
-        #Run jittered: same recon variant but different upstream — the
-        #progress endpoint must NOT report 'done' for jittered.recon
-        #just because baseline.recon ran with the same variant name.
-        d = c.get('/api/chain_progress/mychain/jittered').json()
-        statuses = {s['name']: s['status'] for s in d['steps']}
-        assert statuses == {'forward': 'pending', 'recon': 'pending'}
+        runs = mod.CHAIN.variations['baseline'].run(rr)
+        #Hand-edit recon's run.json to simulate a crash mid-execution.
+        rj_path = Path(runs['recon'].fdir, 'run.json')
+        rj = json.loads(rj_path.read_text())
+        rj['stage_status']['recon'] = 'running'   #not in {done, cached}
+        rj_path.write_text(json.dumps(rj))
+        app_reg = c.app.state.registry
+        app_reg.invalidate()
+        d = c.get('/api/chain_progress/mychain/baseline').json()
+        recon = {s['name']: s for s in d['steps']}['recon']
+        assert recon['status'] == 'mixed'
 
-    def test_progress_surfaces_failed_step_with_error(
+    def test_progress_surfaces_failed_step_with_error_and_completed_siblings(
             self, chain_client, scan_root):
+        """Mid-chain failure must (a) surface the failed step's traceback
+        in the progress response and (b) not hide that earlier steps
+        completed successfully — both are needed for the UI to render a
+        useful failure view."""
         c, scan_root_dir = chain_client
         #Replace the recon pipeline body with one that raises.
         Path(os.path.join(scan_root_dir, '_diffman_chain_recon.py')).write_text(
@@ -266,9 +313,14 @@ class TestChainProgress:
         with pytest.raises(RuntimeError):
             mod.CHAIN.variations['baseline'].run(rr)
         d = c.get('/api/chain_progress/mychain/baseline').json()
-        recon_step = next(s for s in d['steps'] if s['name'] == 'recon')
-        assert recon_step['status'] == 'failed'
-        assert 'recon kaboom' in recon_step['errors']['recon']
+        steps = {s['name']: s for s in d['steps']}
+        #recon: failed, with the exception text in the per-stage errors.
+        assert steps['recon']['status'] == 'failed'
+        assert 'recon kaboom' in steps['recon']['errors']['recon']
+        #forward: ran successfully before recon raised — must NOT be
+        #reported as anything other than done/cached.
+        assert steps['forward']['status'] in ('done', 'cached')
+        assert steps['forward']['fingerprint'] is not None
 
 
 # ---------------------------------------------------------------------------
@@ -417,3 +469,243 @@ class TestMetricCore:
         rec = p.run(dm.registry.get('m', 'base'), rr)
         data = json.loads(Path(rec.fdir, 'stages/s/metrics.json').read_text())
         assert data == {'x': 99}
+
+    def test_metric_recovers_from_corrupt_metrics_json(self, tmp_path,
+                                                        monkeypatch):
+        """A malformed pre-existing metrics.json (truncated write, manual
+        edit gone wrong) must not poison subsequent metric() calls — the
+        file should just be reset rather than raising."""
+        monkeypatch.syspath_prepend(str(tmp_path))
+        dm.registry._variants.clear()
+        dm.registry.register('base', module='m', x=1)
+        def _f(ctx):
+            #Stage runs once, sees a broken metrics.json from "elsewhere".
+            mp = Path(ctx.stage_dir('s')) / 'metrics.json'
+            mp.write_text('{this is not json')
+            ctx.metric('s', 'fresh', 7)
+            return {}
+        p = dm.Pipeline('mp', [dm.Stage('s', _f)], module='m')
+        rr = dm.RunRegistry(root=str(tmp_path / 'runs'))
+        rec = p.run(dm.registry.get('m', 'base'), rr)
+        data = json.loads(Path(rec.fdir, 'stages/s/metrics.json').read_text())
+        assert data == {'fresh': 7}
+
+
+# ---------------------------------------------------------------------------
+# Multi-chain modules (CHAINS = [...])
+# ---------------------------------------------------------------------------
+
+class TestChainsListExport:
+    def test_module_exporting_CHAINS_list_indexes_all_of_them(
+            self, scan_root, make_pipeline):
+        make_pipeline('_diffman_chain_multi', """
+            import diffman as dm
+            def _f(ctx): return {}
+            P = dm.Pipeline('mp', [dm.Stage('s', _f)])
+            CHAINS = [
+                dm.Chain('ch_one', steps=[dm.ChainStep('a', P)]),
+                dm.Chain('ch_two', steps=[dm.ChainStep('a', P)]),
+            ]
+        """)
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=False)
+        with TestClient(app) as c:
+            forest = c.get('/api/chains').json()['forest']
+        names = {n['name'] for n in forest}
+        assert {'ch_one', 'ch_two'} <= names
+        assert discovery.CHAIN_TO_MODULE['ch_one'] == '_diffman_chain_multi'
+        assert discovery.CHAIN_TO_MODULE['ch_two'] == '_diffman_chain_multi'
+
+    def test_module_with_both_CHAIN_and_CHAINS_indexes_union(
+            self, scan_root, make_pipeline):
+        """A module is allowed to declare both `CHAIN = X` and
+        `CHAINS = [Y, Z]` simultaneously — all three should be picked up."""
+        make_pipeline('_diffman_chain_both', """
+            import diffman as dm
+            def _f(ctx): return {}
+            P = dm.Pipeline('p', [dm.Stage('s', _f)])
+            CHAIN  = dm.Chain('singleton', steps=[dm.ChainStep('a', P)])
+            CHAINS = [dm.Chain('list_a', steps=[dm.ChainStep('a', P)]),
+                      dm.Chain('list_b', steps=[dm.ChainStep('a', P)])]
+        """)
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=False)
+        with TestClient(app) as c:
+            names = {n['name'] for n in
+                     c.get('/api/chains').json()['forest']}
+        assert {'singleton', 'list_a', 'list_b'} <= names
+
+
+# ---------------------------------------------------------------------------
+# /api/chain_variation_diff edge cases
+# ---------------------------------------------------------------------------
+
+class TestChainVariationDiffEdges:
+    def test_variation_diff_marks_absent_variant_column(self, scan_root,
+                                                         make_pipeline):
+        """When one of the variations resolves a variant name that doesn't
+        exist in the pipeline's registry, that column must be marked
+        present=False rather than crashing."""
+        make_pipeline('_diffman_chain_vd_fwd', """
+            import diffman as dm
+            dm.register('base', n=1)
+            def _f(ctx): return {}
+            PIPELINE = dm.Pipeline('vd_fwd',
+                [dm.Stage('s', _f, config_keys=('n',))])
+        """)
+        make_pipeline('_diffman_chain_vd_chain', """
+            import diffman as dm
+            import _diffman_chain_vd_fwd as fwd
+            CHAIN = dm.Chain('vd', steps=[dm.ChainStep('fwd', fwd.PIPELINE)])
+            CHAIN.variation('real',   fwd='base')
+            CHAIN.variation('phantom', fwd='does_not_exist')
+        """)
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=False)
+        with TestClient(app) as c:
+            c.get('/api/chains')
+            d = c.get('/api/chain_variation_diff'
+                      '?chain=vd&variations=real,phantom').json()
+        fwd_step = d['steps'][0]
+        by_variation = {col['variation']: col for col in fwd_step['columns']}
+        assert by_variation['real']['present'] is True
+        assert by_variation['phantom']['present'] is False
+        assert 'error' in by_variation['phantom']
+
+    def test_variation_diff_404_when_chain_missing(self, chain_client):
+        c, _ = chain_client
+        r = c.get('/api/chain_variation_diff'
+                  '?chain=ghost&variations=a,b')
+        assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# /api/scoreboard edge cases
+# ---------------------------------------------------------------------------
+
+class TestScoreboardEdges:
+    def test_scoreboard_empty_when_no_runs(self, chain_client):
+        c, _ = chain_client
+        d = c.get('/api/scoreboard/mychain').json()
+        assert d['chain'] == 'mychain'
+        assert d['metric_keys'] == []
+        #Every declared variation gets a row, even with no metrics.
+        var_names = {r['variation'] for r in d['rows']}
+        assert var_names == {'baseline', 'jittered', 'algo_dm'}
+        assert all(r['metrics'] == {} for r in d['rows'])
+
+    def test_scoreboard_does_not_misattribute_metrics_across_variations(
+            self, chain_client, scan_root):
+        """Same critical correctness property as test_progress_does_not_
+        misattribute: a variation's scoreboard row must only include
+        metrics from runs whose upstream-fp matches that variation, even
+        when sibling variations share the same downstream variant name."""
+        c, _ = chain_client
+        discovery.load_module('_diffman_chain_parent')
+        discovery.load_module('_diffman_chain_fwd')
+        mod = sys.modules['_diffman_chain_parent']
+        fwd_mod = sys.modules['_diffman_chain_fwd']
+        rr = dm.RunRegistry(root=str(scan_root / 'runs'))
+        #Run baseline fully (forward=base + recon=ePIE+upstream=base_fp).
+        mod.CHAIN.variations['baseline'].run(rr)
+        #Run JUST forward=jitter alone, no recon for jittered.
+        jitter_v = dm.registry.get('_diffman_chain_fwd', 'jitter')
+        fwd_mod.PIPELINE.run(jitter_v, rr)
+        d = c.get('/api/scoreboard/mychain').json()
+        rows = {row['variation']: row['metrics'] for row in d['rows']}
+        #jittered must show forward.sim.flux (its own forward ran) but
+        #must NOT show recon.recon.iters_done — that's baseline's recon.
+        assert rows['jittered'].get('forward.sim.flux') == 20
+        assert 'recon.recon.iters_done' not in rows['jittered']
+        #baseline still has both (sanity).
+        assert rows['baseline']['forward.sim.flux'] == 10
+        assert rows['baseline']['recon.recon.iters_done'] == 100
+
+
+# ---------------------------------------------------------------------------
+# /api/chains: a module that fails to import is tolerated
+# ---------------------------------------------------------------------------
+
+class TestChainsToleratesBrokenModule:
+    def test_chains_endpoint_skips_modules_that_fail_to_import(
+            self, scan_root, make_pipeline):
+        #One good chain + one broken module. The endpoint should return
+        #the good one rather than 500'ing.
+        make_pipeline('_diffman_chain_good', """
+            import diffman as dm
+            def _f(ctx): return {}
+            P = dm.Pipeline('good', [dm.Stage('s', _f)])
+            CHAIN = dm.Chain('alive', steps=[dm.ChainStep('a', P)])
+        """)
+        make_pipeline('_diffman_chain_broken', """
+            import diffman as dm
+            raise RuntimeError('boom on import')
+            PIPELINE = dm.Pipeline('never', [])
+        """)
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=False)
+        with TestClient(app) as c:
+            forest = c.get('/api/chains').json()['forest']
+        names = {n['name'] for n in forest}
+        assert 'alive' in names
+
+
+# ---------------------------------------------------------------------------
+# Chain source diff edges
+# ---------------------------------------------------------------------------
+
+class TestChainSourceDiffEdges:
+    def test_source_diff_404_when_parent_chain_not_in_scan(
+            self, scan_root, make_pipeline):
+        """Chain declares parent='ghost' but no chain named 'ghost' exists
+        anywhere — must surface as 404, not silent empty diff (the user
+        likely typoed the parent name)."""
+        make_pipeline('_diffman_chain_orphan', """
+            import diffman as dm
+            def _f(ctx): return {}
+            P = dm.Pipeline('p', [dm.Stage('s', _f)])
+            CHAIN = dm.Chain('orphaned', parent='ghost',
+                             steps=[dm.ChainStep('a', P)])
+        """)
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=False)
+        with TestClient(app) as c:
+            c.get('/api/chains')
+            r = c.get('/api/chain_source_diff?chain=orphaned')
+        assert r.status_code == 404
+
+    def test_source_diff_404_when_chain_not_found(self, chain_client):
+        c, _ = chain_client
+        r = c.get('/api/chain_source_diff?chain=ghost')
+        assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Chain-only modules don't pretend to be broken pipelines
+# ---------------------------------------------------------------------------
+
+class TestChainOnlyModuleInPipelineEndpoint:
+    def test_chain_only_module_visible_in_chain_forest_not_pipeline_forest(
+            self, scan_root, make_pipeline):
+        """A module that declares only CHAIN (no PIPELINE) is a valid
+        chain-only module. It must appear in /api/chains, and must NOT
+        clutter /api/pipelines as a 'no PIPELINE attribute' error
+        (which would imply the user forgot to declare one)."""
+        make_pipeline('_diffman_chain_alone', """
+            import diffman as dm
+            def _f(ctx): return {}
+            P = dm.Pipeline('helper', [dm.Stage('s', _f)],
+                            module='_diffman_chain_alone_pipes')
+            CHAIN = dm.Chain('solo', steps=[dm.ChainStep('a', P)])
+        """)
+        app = create_app(root=str(scan_root / 'runs'),
+                         scan_root=str(scan_root), no_scan=False)
+        with TestClient(app) as c:
+            chains = c.get('/api/chains').json()['forest']
+            pipes = c.get('/api/pipelines').json()['forest']
+        assert any(n['name'] == 'solo' for n in chains)
+        #The pipeline forest may include the module-defined PIPELINE
+        #(here, 'helper') but must NOT contain an error entry for the
+        #chain-only module just because it lacks a PIPELINE attribute.
+        for n in pipes:
+            assert n.get('error') != 'no PIPELINE attribute'
