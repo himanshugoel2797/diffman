@@ -202,15 +202,10 @@ class TestProjectWavefield:
 
 
 # ---------------------------------------------------------------------------
-# load: error paths when SRW or numpy is unavailable
+# load: error paths when SRW is unavailable
 # ---------------------------------------------------------------------------
 
 class TestLoadGuards:
-    def test_returns_error_when_numpy_missing(self, monkeypatch):
-        monkeypatch.setattr(srw_loaders, '_HAS_NUMPY', False)
-        out = srw_loaders.load('whatever.h5')
-        assert 'numpy' in out['error']
-
     def test_returns_error_when_srwlib_missing(self, monkeypatch, tmp_path):
         monkeypatch.setattr(srw_loaders, '_srwlib', lambda: None)
         out = srw_loaders.load(str(tmp_path / 'x.h5'))

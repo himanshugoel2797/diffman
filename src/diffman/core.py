@@ -585,7 +585,7 @@ class RunContext:
             shutil.rmtree(dest)
         try:
             os.symlink(src, dest)
-        except (OSError, NotImplementedError, AttributeError):
+        except OSError:
             #Symlinks unsupported (Windows without privilege, exotic FS);
             #fall back to a real copy.
             (shutil.copytree if os.path.isdir(src) else shutil.copy2)(src, dest)

@@ -299,7 +299,6 @@ def test_wfr_to_complex_unpacks_canonical_layout(scan_root, monkeypatch):
             return FakeWfr()
 
     monkeypatch.setattr(srw_loaders, '_srwlib', lambda: FakeSrw())
-    monkeypatch.setattr(srw_loaders, '_HAS_NUMPY', True)
     # _load_wfr_hdf5 wants a path it never reads (srwlib is faked).
     out = srw_loaders._load_wfr_hdf5('unused.h5', FakeSrw())
     assert out['kind'] == 'wavefield'

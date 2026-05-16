@@ -129,13 +129,6 @@ class TestRenderNpy:
         out = renderers.render(str(p))
         assert out['kind'] == 'array_summary'
 
-    def test_npy_without_numpy_returns_binary(self, tmp_path, monkeypatch):
-        p = tmp_path / 'a.npy'
-        np.save(p, np.array([1.0, 2.0]))
-        monkeypatch.setattr(renderers, '_HAS_NUMPY', False)
-        out = renderers.render(str(p))
-        assert out['kind'] == 'binary'
-
 
 # ---------------------------------------------------------------------------
 # HDF5 renderer + dataset preview
