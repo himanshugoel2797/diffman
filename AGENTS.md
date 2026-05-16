@@ -26,13 +26,13 @@ porting a change usually means touching both.
 
 | File | What lives here |
 |------|-----------------|
-| [src/diffman/core.py](src/diffman/core.py) | `Config`, `Variant`, `VariantRegistry`, `Stage`, `Pipeline`, `RunRegistry`, `RunContext`, `RunRecord`, `fingerprint()`. |
+| [src/diffman/core.py](src/diffman/core.py) | `Config`, `Variant`, `VariantRegistry`, `Stage`, `Pipeline`, `Chain`, `ChainStep`, `Variation`, `RunRegistry`, `RunContext`, `RunRecord`, `fingerprint()`, the module-level `register()` helper, and the singleton `registry`. |
 | [src/diffman/discovery.py](src/diffman/discovery.py) | Grep-based `discover()` of pipeline modules; `load_module()`. |
 | [src/diffman/git_backup.py](src/diffman/git_backup.py) | Per-run snapshot of pipeline source into `runs/_scripts/.git/`. Best-effort. |
 | [src/diffman/renderers.py](src/diffman/renderers.py) | Generic artifact renderers; SRW files route to `kind: 'srw'`. |
 | [src/diffman/srw_loaders.py](src/diffman/srw_loaders.py) | SRW file detection + projection (intensity/amplitude/phase/...), downsampling, cuts. |
 | [src/diffman/server.py](src/diffman/server.py) | FastAPI app factory, REST endpoints, `/ws` WebSocket, watchdog filesystem push. Read-only. |
-| [src/diffman/cli.py](src/diffman/cli.py) | Subcommands: `scan`, `list`, `describe`, `serve`. |
+| [src/diffman/cli.py](src/diffman/cli.py) | Subcommands: `scan`, `list`, `describe`, `serve`, `chains`, `chain`, `progress`, `scoreboard`. |
 | [src/diffman/ui/](src/diffman/ui/) | `index.html`, `style.css`, `app.js` — vanilla JS + Plotly via CDN. |
 | [pyproject.toml](pyproject.toml) | pip extras (`[all]` = h5py + plotly) and `[tool.pixi.*]` config (incl. `srwpy` from conda-forge). |
 
@@ -191,22 +191,36 @@ across them:
 
 ## Gotchas
 
-- **`python -m diffman` double-import**: when invoked via `-m`, the module
-  loads as `__main__`. A pipeline module then doing `import diffman`
-  would load a second copy with an empty registry. Resolved by the alias
-  in `__main__.py` — see the comment there. Don't remove it.
-- **`load_module` reuse**: `discovery.load_module(name)` is idempotent
-  (caches by name in `_module_variants`). If you add reload logic, also
-  reset `_module_variants[name]` and `sys.modules[name]`.
-- **WebSocket loop ownership**: `_Broadcaster.loop` is set in the FastAPI
-  `startup` event. Watchdog runs in a separate thread and uses
-  `asyncio.run_coroutine_threadsafe` to push events back.
+- **`python -m diffman` double-import**: when invoked via `-m`, Python
+  loads `__main__.py` as the script `__main__`. We deliberately import
+  the CLI via a *relative* import (`from .cli import main`) so the
+  package side-effect — `diffman/__init__.py` — runs once and lands in
+  `sys.modules['diffman']`. Subsequent `import diffman` inside a user
+  pipeline reuses that module and the shared `registry`. Don't rewrite
+  `__main__.py` to use an absolute `import diffman` or invoke the file
+  directly with `python src/diffman/__main__.py` — both load a second
+  copy of the package with an empty registry.
+- **`load_module` reuse**: `discovery.load_module(name)` is idempotent —
+  it short-circuits on `name in sys.modules`. The only caches it
+  touches are `sys.modules`, `discovery.PIPELINE_TO_MODULE`,
+  `discovery.CHAIN_TO_MODULE`, and the variants attributed to the
+  module inside the global registry. The file watcher (and any reload
+  logic you add) should call `discovery.evict_module(name)` to drop all
+  four atomically instead of poking `sys.modules` directly.
+- **WebSocket loop ownership**: `_Broadcaster.loop` is set inside the
+  FastAPI `lifespan` context manager (via `asyncio.get_running_loop()`).
+  Watchdog runs in a separate thread and `_Broadcaster.schedule()` uses
+  `asyncio.run_coroutine_threadsafe` to hand events back to the event
+  loop. If you start broadcasting before the lifespan runs, the loop
+  attribute is still `None` and the schedule call will crash.
 - **`_safe_under()` path check**: every endpoint that takes a `path=`
   parameter must call `_safe_under(path, registry.root)` before reading
   the file, or you've opened a path-traversal hole.
-- **Variant lookup is module-qualified**: use `registry.get(module, name)`
-  internally; `registry.get_any(name)` works only when exactly one module
-  has registered that name and raises otherwise.
+- **Variant lookup is always module-qualified**: there's no name-only
+  lookup on the registry — you must call `registry.get(module, name)`.
+  Use `registry.for_module(module)` to list a module's variant names.
+  Two pipelines can legitimately each register a `base` variant; the
+  `(module, name)` key keeps them distinct.
 - **`/api/artifact_diff` JSON has two response shapes**: when both
   files parse to dicts, the server returns `{kind: 'json_diff',
   entries: [...]}` (a list of `diff_configs` entries). For arrays /
