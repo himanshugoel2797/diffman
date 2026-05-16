@@ -2,14 +2,34 @@
 
 **Difference manager for simulation pipelines.**
 
-Tracks the graph of how pipelines are *forked* from one another and
-shows the parameter differences at each fork. Browses runs produced by
-those pipelines via a web UI with SRW-aware previews of `.h5`/`.dat`
-artifacts.
+[![PyPI version](https://img.shields.io/pypi/v/diffman.svg)](https://pypi.org/project/diffman/)
+[![Python versions](https://img.shields.io/pypi/pyversions/diffman.svg)](https://pypi.org/project/diffman/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-diffman does **not** launch runs. Pipelines run themselves (your script,
-your scheduler); diffman observes the resulting run directories and
-explains how variants differ.
+diffman tracks the graph of how simulation pipelines are *forked* from
+one another and shows the parameter differences at each fork. It
+discovers runs produced by those pipelines and serves them through a
+read-only web UI with SRW-aware previews of `.h5` / `.dat` artifacts.
+
+diffman does **not** launch runs. Your script (or scheduler) runs the
+pipeline; diffman observes the resulting run directories and explains
+how variants relate to one another.
+
+## Highlights
+
+- **Fork-aware** — declare `parent=` on a pipeline and get per-variant
+  config diffs against the parent, plus a unified source diff of the
+  two pipeline `.py` files.
+- **Variant inheritance** — `dm.register(name, base=..., ...)` layered
+  config with cross-pipeline rename tracking (`forks_of=`).
+- **Live UI** — file-watcher driven, no reloads, with N-way
+  cross-pipeline compare and fingerprint-prefix search.
+- **Artifact diffs** — pick any artifact and diff it against the
+  matching artifact in another run: numpy stats + delta heatmap, JSON
+  structural diff, or unified text diff.
+- **No database** — all state is JSON-on-disk plus a snapshot git repo
+  of pipeline `.py` files per run. Inspectable with `cat` and `git
+  log`.
 
 ```
        pipe_a (root)
@@ -21,17 +41,26 @@ explains how variants differ.
                └── parent=pipe_b
 ```
 
-Spun out from `srwl_uti_diffman.py` in
-[SRW](../xpp_nnl_dataset_gpu/smp_to_det/SRW); that single-file
-stdlib-only version still ships there. This package is the richer
-evolution with heavier deps.
+Grew out of a prototype, `srwl_uti_diffman.py`, written against SRW.
+That prototype was a single-file, stdlib-only sketch and is not
+shipped with SRW; diffman is the standalone, fleshed-out version,
+with SRW awareness kept as an optional integration rather than a
+hard dependency.
 
 ## Install
 
-### pixi (recommended)
+### pip
 
-Provisions a project-local conda+pypi env including `srwpy`, so SRW
-previews work out of the box:
+```bash
+pip install diffman              # core
+pip install "diffman[all]"       # + h5py + plotly previews
+pip install srwpy                # optional: SRW-aware .h5 / .dat previews
+```
+
+### pixi (recommended for SRW users)
+
+Provisions a project-local conda+pypi env with `srwpy` pre-installed,
+so SRW previews work out of the box:
 
 ```bash
 pixi install
@@ -40,11 +69,12 @@ pixi run serve              # http://127.0.0.1:8765
 pixi shell                  # or drop in and use the `diffman` CLI
 ```
 
-### pip
+### From source
 
 ```bash
-pip install -e ".[all]"     # core + h5py + plotly
-pip install srwpy           # optional: SRW-aware previews of .h5 / .dat
+git clone https://github.com/dotnet00/diffman
+cd diffman
+pip install -e ".[all,dev]"
 ```
 
 ## Concepts
@@ -189,6 +219,25 @@ inspectable without a database.
 
 ## Tests
 
-```
+```bash
 pixi run test               # pytest tests/
+# or
+pytest tests/
 ```
+
+## Releasing
+
+Tagged commits trigger the
+[`publish.yml`](.github/workflows/publish.yml) workflow, which builds
+sdist + wheel and publishes to PyPI via trusted publishing (OIDC).
+
+```bash
+# bump version in pyproject.toml, commit, then:
+git tag v0.2.1
+git push origin v0.2.1
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE) if present, or the `license` field in
+[pyproject.toml](pyproject.toml).
