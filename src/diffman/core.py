@@ -16,6 +16,7 @@ itself; diffman does not launch runs.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import inspect
 import json
@@ -24,6 +25,7 @@ import os
 import shutil
 import socket
 import subprocess
+import textwrap
 import time
 import traceback
 from dataclasses import dataclass, field, asdict
@@ -213,11 +215,160 @@ def fingerprint(obj: Any) -> str:
 
 
 def _fn_source_hash(fn: Callable) -> str:
+    """Stable hash of a function's *behavior-relevant* source.
+
+    Parses the function with ``ast`` and hashes ``ast.dump`` of the tree
+    with the leading docstring stripped. That makes the hash immune to
+    comment edits, blank-line shuffles, indentation tweaks and docstring
+    rewrites — common false-invalidation triggers — while still flipping
+    on any change to the executable AST (renames, reordered statements,
+    different literals, etc.).
+
+    Falls back to the legacy source-text hash (and ultimately ``repr``)
+    if source isn't available or doesn't parse — same conservative
+    behavior as before for those cases.
+    """
+    try:
+        src = textwrap.dedent(inspect.getsource(fn))
+    except (OSError, TypeError):
+        return hashlib.sha256(repr(fn).encode()).hexdigest()
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return hashlib.sha256(src.encode()).hexdigest()
+    #Strip the function's docstring (a bare string expression as the first
+    #body statement) so editing the docstring doesn't invalidate cache.
+    for node in tree.body:
+        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.body
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)):
+            node.body = node.body[1:]
+    dumped = ast.dump(tree, annotate_fields=True, include_attributes=False)
+    return hashlib.sha256(dumped.encode()).hexdigest()
+
+
+def _fn_source_hash_legacy(fn: Callable) -> str:
+    """The original source-text-bytes hash used before AST hashing.
+
+    Kept around so existing ``_key`` files (written under this scheme)
+    can be re-validated and migrated to the new hash without forcing the
+    cached stage to re-execute. See ``_maybe_migrate_legacy_key`` for the
+    migration check; see the changelog entry for the rationale.
+    """
     try:
         src = inspect.getsource(fn)
     except (OSError, TypeError):
         src = repr(fn)
     return hashlib.sha256(src.encode()).hexdigest()
+
+
+def _maybe_migrate_legacy_key(stage: 'Stage', new_key: str,
+                              stage_dir: Path, key_file: Path,
+                              new_components: dict,
+                              legacy_upstream_aliases: Optional[dict] = None,
+                              ) -> Optional[str]:
+    """Promote a legacy-scheme cache entry to the AST-scheme in place.
+
+    Returns the legacy key on success (so callers can register it as an
+    alias for downstream stages whose ``upstream`` entries still point at
+    it), or ``None`` if the cache can't be migrated.
+
+    Success requires:
+      * function source byte-identical to what was cached (legacy hash
+        of current fn equals the cached components.fn),
+      * the on-disk ``_key`` reproducible from ``_meta.json`` under the
+        legacy scheme (guards against half-written caches),
+      * config slice identical (canonically),
+      * upstream slice identical, OR every per-name mismatch resolved by
+        a corresponding entry in ``legacy_upstream_aliases``. The aliases
+        let a downstream stage migrate even when an upstream stage just
+        migrated from its legacy key to a new AST key (the cached
+        upstream pointer then matches the alias, not the new key).
+
+    The strict equality check on the legacy fn hash is deliberate: we
+    never stored the cached function's AST hash, so we can't tell whether
+    a *modified* function would still be AST-equivalent. Migrating only
+    byte-identical functions guarantees we never widen the cache-hit set
+    beyond what the legacy scheme itself would have accepted.
+    """
+    meta_path = stage_dir / '_meta.json'
+    if not (meta_path.exists() and key_file.exists()):
+        return None
+    try:
+        text = meta_path.read_text()
+    except OSError:
+        return None
+    try:
+        #raw_decode ignores trailing junk — historically some MPI runs
+        #left extra closing braces from concurrent rank writes; without
+        #this, those caches couldn't migrate and would be needlessly
+        #re-executed.
+        meta, _ = json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(meta, dict):
+        return None
+    cached = meta.get('components') or {}
+    cached_fn = cached.get('fn')
+    if not isinstance(cached_fn, str):
+        return None
+    #Function source must be byte-identical to what was cached. Without
+    #this check, a function edited since cache-write could pass migration
+    #(its AST hash wouldn't match new_key either way, so we'd return
+    #None — but the check below makes the intent explicit).
+    if _fn_source_hash_legacy(stage.fn) != cached_fn:
+        return None
+    #_key file must be reproducible from _meta.json's components under
+    #the legacy scheme — guards against half-written caches.
+    legacy_key = fingerprint({'stage': stage.name, **cached})
+    try:
+        on_disk = key_file.read_text().strip()
+    except OSError:
+        return None
+    if on_disk != legacy_key:
+        return None
+    #Config slice must match (canonically) — function unchanged isn't
+    #enough; the variant config could have shifted. Use fingerprint to
+    #avoid tuple-vs-list-from-json false negatives.
+    if (fingerprint(cached.get('config'))
+            != fingerprint(new_components.get('config'))):
+        return None
+    #Upstream slice: same idea, but each entry can match either the new
+    #key directly or via an alias (the legacy key of an upstream stage
+    #that just migrated in this same pass).
+    aliases = legacy_upstream_aliases or {}
+    cached_up = cached.get('upstream') or {}
+    new_up = new_components.get('upstream') or {}
+    if set(cached_up.keys()) != set(new_up.keys()):
+        return None
+    for name, new_val in new_up.items():
+        cv = cached_up.get(name)
+        if cv == new_val:
+            continue
+        if name in aliases and cv == aliases[name]:
+            continue
+        return None
+    #Atomically rewrite _key first (it's load-bearing for cache lookup),
+    #then _meta.json. A crash between the two leaves _key matching the
+    #new scheme — next lookup hits the fast path and the stale meta is
+    #harmless (only /api/run_diff reads components.fn, and a one-side
+    #mismatch surfaces there as "fn_changed" until the next migration).
+    tmp_key = stage_dir / '_key.tmp'
+    tmp_key.write_text(new_key)
+    os.replace(tmp_key, key_file)
+    meta['components'] = new_components
+    meta['key'] = new_key
+    meta['migrated_from'] = {
+        'scheme': 'source-text-sha256',
+        'fn': cached_fn,
+        'key': legacy_key,
+    }
+    tmp_meta = stage_dir / '_meta.json.tmp'
+    tmp_meta.write_text(json.dumps(meta, indent=2, default=str))
+    os.replace(tmp_meta, meta_path)
+    return legacy_key
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +569,12 @@ class Pipeline:
                           f'{ctx.record.fingerprint[:12]}')
 
         upstream_keys: dict[str, str] = {}
+        #Per-pass map of {stage_name: legacy_key} for stages that we just
+        #migrated from the source-text scheme to the AST scheme. Lets a
+        #downstream stage's migration accept a cached `upstream` pointer
+        #that still references the upstream's *legacy* key — purely a
+        #hash-scheme shift, not a real upstream change.
+        legacy_aliases: dict[str, str] = {}
         for stage in self.stages:
             components = stage.key_components(variant, upstream_keys)
             key = fingerprint({'stage': stage.name, **components})
@@ -435,6 +592,19 @@ class Pipeline:
                     and key_file.read_text().strip() == key):
                 ctx.record.stage_status[stage.name] = 'cached'
                 continue
+
+            #Legacy-scheme cache: if the stored _key was written under the
+            #old source-text fn hash and the function source is byte-equal
+            #to what was cached, migrate the _key/_meta.json in place
+            #rather than re-executing.
+            if stage.name not in force:
+                legacy_key = _maybe_migrate_legacy_key(
+                    stage, key, stage_dir, key_file, components,
+                    legacy_upstream_aliases=legacy_aliases)
+                if legacy_key is not None:
+                    legacy_aliases[stage.name] = legacy_key
+                    ctx.record.stage_status[stage.name] = 'cached'
+                    continue
 
             if assume_cached:
                 raise RuntimeError(

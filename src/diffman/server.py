@@ -32,6 +32,7 @@ Routes:
   GET  /api/scoreboard/{name}[?baseline=<var>]    → variation × metric table
   GET  /api/run_diff?pipeline=&variant=&a=&b=     → explain why two runs differ
   GET  /api/disk_usage                            → bytes per pipeline/variant/run
+  GET  /api/stale_runs                            → runs with cache-key mismatches the user may want to clean
   GET  /artifact/{pipeline}/{variant}/{fp}/{rest} → raw file download
   WS   /ws                                        → push updates (run_changed, pipelines_changed)
 """
@@ -56,7 +57,9 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import discovery, renderers
-from .core import RunRegistry, registry as _global_registry
+from .core import (RunRegistry, fingerprint,
+                   _fn_source_hash_legacy,
+                   registry as _global_registry)
 
 # Optional: watchdog for filesystem push.
 try:
@@ -1204,6 +1207,63 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
         return {'run': match.__dict__, 'config': cfg,
                 'stages': _stage_summaries(match)}
 
+    @app.get('/api/run_variations/{pipeline}/{variant}/{short_fp}')
+    def _run_variations(pipeline: str, variant: str, short_fp: str):
+        """Chain variations that thread this specific run.
+
+        Walks every registered chain × variation, resolves the per-step
+        run-fp join (same logic as /api/chain_progress), and reports
+        every (chain, variation, step) tuple whose matched run fingerprint
+        equals this run's. A run can appear under multiple variations
+        when several variations share the same pipeline/variant binding
+        and consume identical upstream fingerprints (e.g. base + jitter
+        variations that all reuse `recon_analysis=default`).
+        """
+        runs = app.state.registry.list_runs(pipeline=pipeline, variant=variant)
+        target = next((r for r in runs
+                       if r.fingerprint.startswith(short_fp)), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail='run not found')
+        target_fp = target.fingerprint
+        all_runs = app.state.registry.list_runs()
+
+        seen_chains: set[str] = set()
+        matches: list[dict] = []
+        for entry in discovery.DISCOVERED_LIST:
+            try:
+                mod = discovery.load_module(entry['module'])
+            except Exception:
+                continue
+            for chain in discovery.chains_in_module(mod):
+                if chain.name in seen_chains:
+                    continue
+                seen_chains.add(chain.name)
+                #Only iterate variations whose chain even references this
+                #pipeline — saves the per-variation join in the common case
+                #where most chains have nothing to do with this run.
+                candidate_steps = [s for s in chain.steps
+                                   if s.pipeline.name == pipeline]
+                if not candidate_steps:
+                    continue
+                for v_name, variation in chain.variations.items():
+                    try:
+                        per_branch = _resolve_variation_branches(
+                            chain, variation, all_runs)
+                    except Exception:
+                        continue
+                    for step in candidate_steps:
+                        for br in per_branch.get(step.name, []):
+                            r = br['run']
+                            if r is not None and r.fingerprint == target_fp:
+                                matches.append({
+                                    'chain': chain.name,
+                                    'variation': v_name,
+                                    'step': step.name,
+                                    'branch_key': br['branch_key'],
+                                    'variant': br['variant'],
+                                })
+        return {'matches': matches}
+
     @app.get('/api/disk_usage')
     def _disk_usage():
         """Bytes-on-disk rollup of the runs root, grouped by
@@ -1246,6 +1306,202 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
                               'variants': variants})
             grand_total += ptotal
         return {'root': root, 'total': grand_total, 'pipelines': pipelines}
+
+    @app.get('/api/stale_runs')
+    def _stale_runs():
+        """Scan run-dirs and report stages whose cached _key disagrees
+        with what the current pipeline + variant would compute.
+
+        Read-only: never deletes anything and never migrates the cache
+        on disk (migration only happens during a real ``Pipeline.run``).
+        Stages whose legacy-scheme cache would migrate cleanly on the
+        next access are filtered out, so the user only sees genuinely
+        stale entries — the ones a re-run wouldn't recover.
+
+        Returns a flat list of ``{pipeline, variant, short_fp, fingerprint,
+        chain, variation, started, stage, reason, expected_key, actual_key,
+        components_diff}`` rows. The UI groups by run; the API stays flat
+        so callers can sort/filter freely.
+        """
+        rows: list[dict] = []
+        seen_pipelines: set[str] = set()
+        #Import every discovered module so the variant registry is fully
+        #populated. The pipeline forest endpoint already triggers this on
+        #demand; here we trigger it eagerly because we need to compute
+        #expected keys for every (pipeline, variant) tuple seen on disk.
+        for entry in discovery.DISCOVERED_LIST:
+            try:
+                discovery.load_module(entry['module'])
+            except Exception:
+                continue
+
+        #Map pipeline name → (Pipeline, declaring module). A pipeline's
+        #declaring module is the key under which its variants are
+        #registered, so we need it to resolve variants by name.
+        pipe_index: dict[str, tuple] = {}
+        for mod_name in set(discovery.PATH_TO_MODULE.values()):
+            mod = sys.modules.get(mod_name)
+            if mod is None:
+                continue
+            pipe = getattr(mod, 'PIPELINE', None)
+            if pipe is not None:
+                pipe_index[pipe.name] = (pipe, getattr(pipe, '_module',
+                                                       mod_name))
+
+        all_runs = app.state.registry.list_runs()
+        for record in all_runs:
+            entry = pipe_index.get(record.pipeline)
+            if entry is None:
+                #Pipeline isn't currently registered (module renamed,
+                #deleted, or just not discovered). Surface as unresolved
+                #so the user can find these dirs.
+                rows.append({
+                    'pipeline': record.pipeline,
+                    'variant': record.variant,
+                    'short_fp': record.fingerprint[:12],
+                    'fingerprint': record.fingerprint,
+                    'chain': record.chain,
+                    'variation': record.variation,
+                    'started': record.started,
+                    'stage': None,
+                    'reason': 'pipeline_not_registered',
+                })
+                continue
+            pipe, pipe_module = entry
+            try:
+                variant = _global_registry.get(pipe_module, record.variant)
+            except KeyError:
+                rows.append({
+                    'pipeline': record.pipeline,
+                    'variant': record.variant,
+                    'short_fp': record.fingerprint[:12],
+                    'fingerprint': record.fingerprint,
+                    'chain': record.chain,
+                    'variation': record.variation,
+                    'started': record.started,
+                    'stage': None,
+                    'reason': 'variant_not_registered',
+                })
+                continue
+
+            #Recompute the expected key for each stage exactly as
+            #Pipeline.run does — accumulating upstream_keys so a
+            #dependent stage sees the *current* upstream-stage key, not
+            #whatever was cached. `legacy_aliases` mirrors the cascade
+            #migration in Pipeline.run: when an upstream stage would
+            #auto-migrate, its legacy key is a valid alias for the new
+            #key when checking downstream stages.
+            upstream_keys: dict[str, str] = {}
+            legacy_aliases: dict[str, str] = {}
+            for stage in pipe.stages:
+                components = stage.key_components(variant, upstream_keys)
+                expected = fingerprint({'stage': stage.name, **components})
+                upstream_keys[stage.name] = expected
+
+                stage_dir = Path(record.fdir, 'stages', stage.name)
+                key_file = stage_dir / '_key'
+                if not key_file.exists():
+                    continue
+                try:
+                    actual = key_file.read_text().strip()
+                except OSError:
+                    continue
+                if actual == expected:
+                    continue
+
+                #Read _meta.json (tolerating trailing-junk left by some
+                #MPI runs) to attribute the mismatch and to evaluate
+                #auto-migration eligibility.
+                cached: dict = {}
+                meta_path = stage_dir / '_meta.json'
+                if meta_path.exists():
+                    try:
+                        cached, _ = json.JSONDecoder().raw_decode(
+                            meta_path.read_text())
+                        if not isinstance(cached, dict):
+                            cached = {}
+                    except (json.JSONDecodeError, OSError):
+                        cached = {}
+                cached_components = cached.get('components') or {}
+                cached_fn = cached_components.get('fn')
+
+                #Auto-migration eligible? — same predicate as
+                #_maybe_migrate_legacy_key, including the cascade-alias
+                #rule for upstream. Record the legacy key on success so
+                #downstream stages can also pass.
+                eligible = False
+                if (isinstance(cached_fn, str)
+                        and _fn_source_hash_legacy(stage.fn) == cached_fn):
+                    legacy_key = fingerprint({'stage': stage.name,
+                                              **cached_components})
+                    if (legacy_key == actual
+                            and fingerprint(cached_components.get('config'))
+                                == fingerprint(components.get('config'))):
+                        cached_up = cached_components.get('upstream') or {}
+                        new_up = components.get('upstream') or {}
+                        if set(cached_up.keys()) == set(new_up.keys()):
+                            up_ok = True
+                            for n, nv in new_up.items():
+                                cv = cached_up.get(n)
+                                if cv == nv:
+                                    continue
+                                if n in legacy_aliases and cv == legacy_aliases[n]:
+                                    continue
+                                up_ok = False
+                                break
+                            if up_ok:
+                                eligible = True
+                                legacy_aliases[stage.name] = legacy_key
+                if eligible:
+                    continue
+
+                #Attribute the mismatch — fn / config / upstream.
+                fn_changed = (cached_components.get('fn')
+                              != components.get('fn'))
+                if fn_changed and isinstance(cached_fn, str):
+                    #Legacy fn hash of the current source equals cached
+                    #→ source is unchanged, only the scheme moved.
+                    if _fn_source_hash_legacy(stage.fn) == cached_fn:
+                        fn_changed = False
+                config_changed = (fingerprint(cached_components.get('config'))
+                                  != fingerprint(components.get('config')))
+                #Upstream: same alias-aware comparison as eligibility above.
+                cached_up = cached_components.get('upstream') or {}
+                new_up = components.get('upstream') or {}
+                upstream_changed = False
+                if set(cached_up.keys()) != set(new_up.keys()):
+                    upstream_changed = True
+                else:
+                    for n, nv in new_up.items():
+                        cv = cached_up.get(n)
+                        if cv == nv:
+                            continue
+                        if n in legacy_aliases and cv == legacy_aliases[n]:
+                            continue
+                        upstream_changed = True
+                        break
+                reasons = []
+                if fn_changed: reasons.append('fn')
+                if config_changed: reasons.append('config')
+                if upstream_changed: reasons.append('upstream')
+                if not reasons:
+                    reasons = ['unknown']
+
+                rows.append({
+                    'pipeline': record.pipeline,
+                    'variant': record.variant,
+                    'short_fp': record.fingerprint[:12],
+                    'fingerprint': record.fingerprint,
+                    'chain': record.chain,
+                    'variation': record.variation,
+                    'started': record.started,
+                    'stage': stage.name,
+                    'reason': ','.join(reasons),
+                    'expected_key': expected,
+                    'actual_key': actual,
+                    'fdir': record.fdir,
+                })
+        return {'rows': rows}
 
     @app.get('/api/run_diff')
     def _run_diff(pipeline: str, variant: str, a: str, b: str):

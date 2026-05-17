@@ -1019,6 +1019,97 @@ const App = {
     main.appendChild(tbl);
   },
 
+  async showStaleRuns() {
+    //Read-only inventory of runs whose cached stage _keys disagree
+    //with what the current pipeline+variant would compute. No delete
+    //actions — surfacing only. The user navigates to the run dir on
+    //disk (or to the run detail page) and decides what to do.
+    this.current = {kind: 'stale'};
+    const main = $('#main'); main.innerHTML = '';
+    main.appendChild(el('h2', {text: 'Stale runs'}));
+    main.appendChild(el('p', {class: 'hint',
+      text: 'Runs whose cached stage _key would not match the current '
+          + 'pipeline. Auto-migratable entries (function source '
+          + 'byte-identical to cache) are filtered out. diffman never '
+          + 'deletes anything — use these paths to decide for yourself.'}));
+    let d;
+    try { d = await jget('/api/stale_runs'); }
+    catch (e) { main.appendChild(el('pre', {text: 'failed: ' + e})); return; }
+    if (!d.rows || !d.rows.length) {
+      main.appendChild(el('p', {text: '(no stale runs)'}));
+      return;
+    }
+
+    //Group by (pipeline, variant, short_fp) so a run with two stale
+    //stages shows up once with both stages listed.
+    const groups = new Map();
+    for (const r of d.rows) {
+      const k = `${r.pipeline}|${r.variant}|${r.short_fp}`;
+      if (!groups.has(k)) {
+        groups.set(k, {
+          pipeline: r.pipeline, variant: r.variant,
+          short_fp: r.short_fp, fingerprint: r.fingerprint,
+          chain: r.chain, variation: r.variation, started: r.started,
+          fdir: r.fdir, stages: [], runLevel: null,
+        });
+      }
+      const g = groups.get(k);
+      if (r.stage) {
+        g.stages.push({name: r.stage, reason: r.reason,
+                       expected: r.expected_key, actual: r.actual_key});
+      } else {
+        //Run-level reason (e.g. pipeline/variant no longer registered).
+        g.runLevel = r.reason;
+      }
+    }
+
+    const tbl = el('table', {class: 'compare-table'});
+    tbl.appendChild(el('tr', {}, [
+      el('th', {text: 'pipeline / variant'}),
+      el('th', {text: 'run'}),
+      el('th', {text: 'chain · variation'}),
+      el('th', {text: 'started'}),
+      el('th', {text: 'stale stages'}),
+      el('th', {text: 'on-disk path'}),
+    ]));
+    //Sort: pipeline, variant, started desc.
+    const rows = [...groups.values()].sort((a, b) => {
+      if (a.pipeline !== b.pipeline) return a.pipeline < b.pipeline ? -1 : 1;
+      if (a.variant !== b.variant) return a.variant < b.variant ? -1 : 1;
+      return (b.started || '').localeCompare(a.started || '');
+    });
+    for (const g of rows) {
+      const stagesCell = el('td', {});
+      if (g.runLevel) {
+        stagesCell.appendChild(el('span', {class: 'badge-stale',
+          text: g.runLevel}));
+      } else {
+        for (const s of g.stages) {
+          const span = el('span', {class: 'badge-stale',
+            title: `expected ${s.expected.slice(0,12)} · `
+                 + `actual ${s.actual.slice(0,12)}`,
+            text: `${s.name} (${s.reason})`});
+          stagesCell.appendChild(span);
+          stagesCell.appendChild(document.createTextNode(' '));
+        }
+      }
+      tbl.appendChild(el('tr', {}, [
+        el('td', {text: `${g.pipeline} / ${g.variant}`}),
+        el('td', {}, [
+          el('a', {href: '#', text: g.short_fp,
+            onclick: ev => { ev.preventDefault();
+              this.showRun(g.pipeline, g.variant, g.short_fp); }}),
+        ]),
+        el('td', {text: g.chain && g.variation
+          ? `${g.chain} · ${g.variation}` : '—'}),
+        el('td', {text: g.started || ''}),
+        stagesCell,
+        el('td', {class: 'mono', text: g.fdir || ''}),
+      ]));
+    }
+    main.appendChild(tbl);
+  },
+
   async find() {
     const q = $('#find-q').value.trim();
     if (q.length < 4) { alert('need at least 4 chars'); return; }
@@ -1074,6 +1165,37 @@ const App = {
         el('a', {href: '#', text: `→ ${mod} / ${variant} (variant overrides)`,
           onclick: ev => { ev.preventDefault(); this.showVariant(mod, variant); }})
       ]));
+    }
+
+    //Chain variations that thread this run — surfaces the chain-level
+    //context (e.g. APS jitter sweep, mode sweep) so the user can see
+    //which higher-level study this run is part of without having to
+    //guess from the pipeline name alone.
+    try {
+      const rv = await jget(`/api/run_variations/${encodeURIComponent(pipeline)}/${encodeURIComponent(variant)}/${encodeURIComponent(short_fp)}`);
+      if (rv.matches && rv.matches.length) {
+        main.appendChild(el('h3', {text: 'Chain variations'}));
+        const list = el('div', {class: 'variant-list'});
+        //De-duplicate by (chain, variation) so we don't repeat a row per
+        //matched step. Per-chain branch_keys for fan-out variations are
+        //preserved by appending them to the label.
+        const seen = new Set();
+        for (const m of rv.matches) {
+          const k = `${m.chain}|${m.variation}|${m.branch_key || ''}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          const label = m.branch_key
+            ? `${m.chain} / ${m.variation}  (branch: ${m.branch_key}, step: ${m.step})`
+            : `${m.chain} / ${m.variation}  (step: ${m.step})`;
+          list.appendChild(el('a', {
+            href: '#', text: label,
+            onclick: ev => { ev.preventDefault();
+              this.showChain(m.chain, m.variation); }}));
+        }
+        main.appendChild(list);
+      }
+    } catch (e) {
+      //Non-fatal — the variations list is informational.
     }
 
     //"Why did this re-run vs ..." action.

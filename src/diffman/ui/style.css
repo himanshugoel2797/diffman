@@ -233,6 +233,15 @@ table.compare-table {
 .compare-table th.missing { color: var(--err); text-decoration: line-through; }
 .compare-table tr.compare-differs { background: #fff5e6; }
 
+/* Stale-run pill: a stage that no longer matches the current key. */
+.badge-stale {
+  display: inline-block; padding: 1px 6px; margin: 1px 0;
+  background: #fdecea; color: #762525; border-radius: 3px;
+  font-size: 11px; white-space: nowrap;
+}
+.mono { font-family: ui-monospace, monospace; font-size: 11px;
+        color: #555; word-break: break-all; }
+
 /* Chain tree view: one column per step, one row per branch lane.
    Single-branch steps render a card that spans every lane; fan-out
    steps render one card per lane and the inter-step connector SVG
