@@ -130,6 +130,13 @@ button.ghost {
   display: flex; gap: 12px; align-items: center; font-size: 13px;
   margin-bottom: 6px; color: #555;
 }
+.artifact .header.clickable { cursor: pointer; user-select: none; }
+.artifact .header.clickable:hover { color: #000; }
+.artifact .header .caret {
+  display: inline-block; width: 10px; font-size: 10px; color: #888;
+}
+.artifact.collapsed { margin: 2px 0; padding: 4px 12px; }
+.artifact.collapsed .header { margin-bottom: 0; }
 .artifact .header .path { font-family: ui-monospace, monospace; color: #222; }
 .artifact .header .meta { color: #888; }
 .artifact .body img { max-width: 100%; }

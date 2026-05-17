@@ -510,6 +510,13 @@ if _HAS_WATCHDOG:
         def on_any_event(self, event):
             if event.is_directory:
                 return
+            #Read-only events (opened, accessed, closed_no_write) fire when
+            #the server itself reads an artifact for /api/render; treating
+            #those as run state changes makes the UI re-render and collapse
+            #any expanded preview.
+            if event.event_type not in ('created', 'modified',
+                                         'deleted', 'moved'):
+                return
             #Anything under the runs root invalidates the cached run list.
             self.run_registry.invalidate()
             k = self._key(event.src_path)

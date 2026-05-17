@@ -1154,14 +1154,32 @@ const App = {
   },
 
   async showStage(pipeline, variant, short_fp, stage) {
+    //Track whether the previous view was already this exact stage; if so,
+    //we may be able to skip the re-render and preserve expanded previews.
+    const wasSameStage = this.current
+      && this.current.kind === 'stage'
+      && this.current.pipeline === pipeline
+      && this.current.variant === variant
+      && this.current.short_fp === short_fp
+      && this.current.stage === stage;
     this.current = {kind: 'stage', pipeline, variant, short_fp, stage};
     let d;
     try {
       d = await jget(`/api/stage/${encodeURIComponent(pipeline)}/${encodeURIComponent(variant)}/${encodeURIComponent(short_fp)}/${encodeURIComponent(stage)}`);
     } catch (e) {
       $('#main').innerHTML = ''; $('#main').appendChild(el('pre', {text: String(e)}));
+      this._lastStageSig = null;
       return;
     }
+    //handleRunChanged re-invokes showStage on any /ws run_changed event;
+    //skip the re-render when the payload hasn't meaningfully changed, so
+    //we don't wipe out the user's expanded-preview state.
+    const sig = JSON.stringify({
+      status: d.status, key: d.key, error: d.error,
+      artifacts: (d.artifacts || []).map(a => [a.path, a.size]),
+    });
+    if (wasSameStage && this._lastStageSig === sig) return;
+    this._lastStageSig = sig;
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `${pipeline} / ${variant} / ${stage}`,
                                title: short_fp}));
@@ -1186,20 +1204,37 @@ const App = {
       main.appendChild(el('p', {class: 'hint', text: '(no artifacts yet)'}));
       return;
     }
+    main.appendChild(el('p', {class: 'hint',
+      text: `${d.artifacts.length} output${d.artifacts.length === 1 ? '' : 's'} ` +
+            '— click a row to preview.'}));
     for (const a of d.artifacts) {
-      const card = el('div', {class: 'artifact'});
-      card.appendChild(el('div', {class: 'header'}, [
+      const card = el('div', {class: 'artifact collapsed'});
+      const caret = el('span', {class: 'caret', text: '▶'});
+      const header = el('div', {class: 'header clickable'}, [
+        caret,
         el('span', {class: 'path', text: a.path}),
         el('span', {class: 'meta', text: humanSize(a.size)}),
         el('a', {href: artifactHref(pipeline, variant, short_fp, a.path),
-                 target: '_blank', text: 'download'}),
+                 target: '_blank', text: 'download',
+                 onclick: ev => ev.stopPropagation()}),
         el('button', {class: 'ghost', text: 'Diff vs…',
-          onclick: () => this.diffArtifactPrompt(a)}),
-      ]));
-      const body = el('div', {class: 'body'});
+          onclick: ev => { ev.stopPropagation();
+                           this.diffArtifactPrompt(a); }}),
+      ]);
+      const body = el('div', {class: 'body', style: 'display:none'});
+      let loaded = false;
+      header.onclick = () => {
+        const isCollapsed = card.classList.toggle('collapsed');
+        caret.textContent = isCollapsed ? '▶' : '▼';
+        body.style.display = isCollapsed ? 'none' : '';
+        if (!isCollapsed && !loaded) {
+          loaded = true;
+          this.renderArtifact(body, a, {pipeline, variant, short_fp});
+        }
+      };
+      card.appendChild(header);
       card.appendChild(body);
       main.appendChild(card);
-      this.renderArtifact(body, a, {pipeline, variant, short_fp});
     }
   },
 

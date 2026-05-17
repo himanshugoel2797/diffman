@@ -43,6 +43,17 @@ def _caller_module() -> Optional[str]:
     return inspect.currentframe().f_back.f_back.f_globals.get('__name__')
 
 
+def _caller_source_file() -> Optional[str]:
+    """Return the calling frame's __file__, two frames up.
+
+    Used by `Pipeline()` / `Chain()` to attribute themselves to the
+    source file that constructed them, so the per-run git snapshot
+    captures the right `.py` regardless of whether the module was loaded
+    via diffman discovery or run as a plain script.
+    """
+    return inspect.currentframe().f_back.f_back.f_globals.get('__file__')
+
+
 def _try_snapshot(root: str, source_file: str, message: str) -> None:
     """Best-effort git snapshot of a pipeline / chain source file.
 
@@ -276,7 +287,11 @@ class Pipeline:
         self.name = name
         self.stages = list(stages)
         self.parent = parent  # name of the pipeline this was forked from
-        self._source_file: Optional[str] = None  # set by discovery.load_module
+        #Caller's __file__ — drives the per-run git snapshot in
+        #<runs_root>/_scripts/.git/. Falls back to the discovery loader's
+        #explicit assignment for the unusual case where the caller frame
+        #has no __file__ (e.g., interactive REPL).
+        self._source_file: Optional[str] = _caller_source_file()
         #Caller's __name__ — used by Chain to resolve variant names against
         #the right module-scoped registry entry. Pass `module=` explicitly
         #to override (constructing Pipelines dynamically in tests).
@@ -513,7 +528,8 @@ class Chain:
         self.steps = list(steps)
         self.parent = parent
         self.variations: dict[str, Variation] = {}
-        self._source_file: Optional[str] = None
+        #Caller's __file__ — see Pipeline.__init__ for the rationale.
+        self._source_file: Optional[str] = _caller_source_file()
         self._validate()
 
     def _validate(self):
