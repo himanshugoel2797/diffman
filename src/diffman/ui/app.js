@@ -1481,6 +1481,8 @@ const App = {
     const m = payload.meta || {};
     if (k === 'srw') {
       this.renderSRW(container, artifact.absolute);
+    } else if (k === 'ptyr') {
+      this.renderPtyr(container, artifact.absolute);
     } else if (k === 'image') {
       const src = artifactHref(refs.pipeline, refs.variant, refs.short_fp, artifact.path);
       container.appendChild(el('img', {src: src + '?t=' + Date.now()}));
@@ -1601,6 +1603,174 @@ const App = {
     reprSel.onchange = () => { state.repr = reprSel.value; fetchAndDraw(); };
     polSel.onchange = () => { state.polarization = polSel.value; fetchAndDraw(); };
     eIdx.onchange = () => { state.energy_slice = parseInt(eIdx.value || '-1', 10); fetchAndDraw(); };
+    fetchAndDraw();
+  },
+
+  async renderPtyr(container, path) {
+    //PtyPy .ptyr preview — mirrors renderSRW but axes are obj/probe
+    //storages, layer/mode index, and complex-array repr. Cuts are wired
+    //up the same way (click in the heatmap to move the cross-hair).
+    container.innerHTML = '';
+    const state = {path, kind: 'obj', storage: '', mode: 0,
+                   repr: 'amplitude', row: -1, col: -1, summary: null};
+    const controls = el('div', {class: 'row', style: 'margin-bottom:8px'});
+    const kindSel = el('select');
+    kindSel.appendChild(el('option', {value: 'obj',   text: 'object'}));
+    kindSel.appendChild(el('option', {value: 'probe', text: 'probe'}));
+    const storSel = el('select');
+    const modeSel = el('select');
+    const reprSel = el('select');
+    for (const r of ['amplitude', 'phase', 'real', 'imag', 'intensity'])
+      reprSel.appendChild(el('option', {value: r, text: r}));
+    reprSel.value = 'amplitude';
+    controls.appendChild(el('label', {}, ['kind: ']));    controls.appendChild(kindSel);
+    controls.appendChild(el('label', {}, [' storage: '])); controls.appendChild(storSel);
+    controls.appendChild(el('label', {}, [' mode: ']));   controls.appendChild(modeSel);
+    controls.appendChild(el('label', {}, [' repr: ']));   controls.appendChild(reprSel);
+    container.appendChild(controls);
+
+    const grid = el('div', {style:
+      'display:grid;grid-template-columns:2fr 1fr;grid-template-rows:auto auto;gap:8px'});
+    const heatDiv = el('div', {class: 'plot', style: 'grid-row:1/3'});
+    const hcutDiv = el('div', {class: 'plot', style: 'min-height:180px'});
+    const vcutDiv = el('div', {class: 'plot', style: 'min-height:180px'});
+    grid.appendChild(heatDiv); grid.appendChild(hcutDiv); grid.appendChild(vcutDiv);
+    container.appendChild(grid);
+    const meta = el('div', {class: 'hint', style: 'margin-top:6px'});
+    container.appendChild(meta);
+    //Convergence sub-plot — only rendered once when the summary first
+    //arrives (it's static for the lifetime of the file).
+    const convDiv = el('div', {class: 'plot', style: 'min-height:220px;margin-top:8px'});
+    container.appendChild(convDiv);
+
+    const repopulateStorageAndMode = (summary, fillSelectors) => {
+      const list = (summary.storages && summary.storages[state.kind]) || [];
+      if (fillSelectors) {
+        storSel.innerHTML = '';
+        for (const s of list)
+          storSel.appendChild(el('option', {value: s.id,
+            text: `${s.id}  [${(s.shape || []).join('×')}]`}));
+        if (list.length) {
+          state.storage = list[0].id;
+          storSel.value = state.storage;
+        } else {
+          state.storage = '';
+        }
+      }
+      const cur = list.find(s => s.id === state.storage) || list[0];
+      const nmodes = cur ? (cur.shape || [1])[0] : 1;
+      modeSel.innerHTML = '';
+      for (let i = 0; i < nmodes; i++)
+        modeSel.appendChild(el('option', {value: String(i), text: String(i)}));
+      state.mode = Math.min(state.mode, nmodes - 1);
+      modeSel.value = String(state.mode);
+    };
+
+    const fetchAndDraw = async () => {
+      const q = new URLSearchParams({
+        path, kind: state.kind, storage: state.storage,
+        mode: state.mode, repr: state.repr,
+        row: state.row, col: state.col});
+      let payload;
+      try { payload = await jget('/api/ptyr_preview?' + q); }
+      catch (e) { meta.textContent = 'preview failed: ' + e; return; }
+      if (payload.kind === 'error') {
+        meta.textContent = 'preview error: ' + payload.data; return;
+      }
+      const m = payload.meta;
+      if (state.summary === null) {
+        state.summary = {storages: m.storages, iter_info: m.iter_info || {}};
+        //Default kind: if obj is empty but probe isn't, pick probe.
+        if (!(state.summary.storages.obj || []).length
+            && (state.summary.storages.probe || []).length) {
+          state.kind = 'probe'; kindSel.value = 'probe';
+        }
+        repopulateStorageAndMode(state.summary, true);
+        //Re-fetch with the correct storage if defaulting picked one.
+        if (m.storage !== state.storage && state.storage) {
+          return fetchAndDraw();
+        }
+        drawConvergence(state.summary.iter_info);
+      }
+      const z = payload.data.z, cut = payload.data.cut;
+      //Axes in microns relative to origin. psize/origin are in metres.
+      const ny = z.length, nx = z[0].length;
+      const sy = (m.downsampled && m.downsampled[0]) || 1;
+      const sx = (m.downsampled && m.downsampled[1]) || 1;
+      const py = (m.psize && m.psize[0]) || 1;
+      const px = (m.psize && m.psize[1]) || 1;
+      const oy = (m.origin && m.origin[0]) || 0;
+      const ox = (m.origin && m.origin[1]) || 0;
+      const xs = new Array(nx);
+      for (let i = 0; i < nx; i++) xs[i] = (ox + i * sx * px) * 1e6;
+      const ys = new Array(ny);
+      for (let j = 0; j < ny; j++) ys[j] = (oy + j * sy * py) * 1e6;
+      const ds = (sy > 1 || sx > 1) ? `  (downsampled ${sy}×${sx})` : '';
+      Plotly.react(heatDiv, [{z, x: xs, y: ys, type: 'heatmap',
+                              colorscale: state.repr === 'phase' ? 'HSV' : 'Viridis'}], {
+        margin: {t: 24, l: 50, r: 20, b: 40},
+        xaxis: {title: 'x [µm]'}, yaxis: {title: 'y [µm]', scaleanchor: 'x'},
+        title: `${m.kind} · ${m.storage} · mode ${m.mode}/${m.nmodes - 1} · ${m.repr}${ds}`,
+        shapes: [
+          {type:'line', x0:xs[cut.col], x1:xs[cut.col], y0:ys[0], y1:ys[ys.length-1], line:{color:'red', width:1}},
+          {type:'line', y0:ys[cut.row], y1:ys[cut.row], x0:xs[0], x1:xs[xs.length-1], line:{color:'red', width:1}},
+        ],
+      });
+      Plotly.react(hcutDiv, [{x: xs, y: cut.h, type: 'scatter', mode: 'lines',
+                              line: {color: '#c0392b'}}],
+        {margin: {t: 20, l: 50, r: 20, b: 30},
+         title: `horizontal cut @ row=${cut.row}`, xaxis: {title: 'x [µm]'}});
+      Plotly.react(vcutDiv, [{x: ys, y: cut.v, type: 'scatter', mode: 'lines',
+                              line: {color: '#c0392b'}}],
+        {margin: {t: 20, l: 50, r: 20, b: 30},
+         title: `vertical cut @ col=${cut.col}`, xaxis: {title: 'y [µm]'}});
+      const psStr = (m.psize || []).map(v => fmt(v)).join(' × ');
+      meta.textContent =
+        `shape: ${(m.shape || []).join('×')}  ·  pixel size: ${psStr} m  ` +
+        `·  cross-hair: (row=${cut.row}, col=${cut.col})`;
+      heatDiv.removeAllListeners?.();
+      heatDiv.on('plotly_click', ev => {
+        const p = ev.points && ev.points[0]; if (!p) return;
+        state.col = p.pointIndex[1]; state.row = p.pointIndex[0];
+        fetchAndDraw();
+      });
+    };
+
+    const drawConvergence = (ii) => {
+      if (!ii || !ii.iteration || !ii.iteration.length) {
+        convDiv.style.display = 'none'; return;
+      }
+      const traces = [];
+      if (ii.error_fourier)
+        traces.push({x: ii.iteration, y: ii.error_fourier, type: 'scatter',
+                     mode: 'lines', name: 'fourier'});
+      if (ii.error_overlap)
+        traces.push({x: ii.iteration, y: ii.error_overlap, type: 'scatter',
+                     mode: 'lines', name: 'overlap'});
+      Plotly.newPlot(convDiv, traces, {
+        margin: {t: 24, l: 60, r: 20, b: 40},
+        title: 'convergence',
+        xaxis: {title: 'iteration'},
+        yaxis: {title: 'error', type: 'log'},
+      });
+    };
+
+    kindSel.onchange = () => {
+      state.kind = kindSel.value;
+      if (state.summary) repopulateStorageAndMode(state.summary, true);
+      state.row = -1; state.col = -1;
+      fetchAndDraw();
+    };
+    storSel.onchange = () => {
+      state.storage = storSel.value;
+      if (state.summary) repopulateStorageAndMode(state.summary, false);
+      state.row = -1; state.col = -1;
+      fetchAndDraw();
+    };
+    modeSel.onchange = () => {
+      state.mode = parseInt(modeSel.value, 10) || 0; fetchAndDraw();
+    };
+    reprSel.onchange = () => { state.repr = reprSel.value; fetchAndDraw(); };
     fetchAndDraw();
   },
 

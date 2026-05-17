@@ -1307,16 +1307,17 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
         stage_dir = os.path.join(match.fdir, 'stages', stage)
         outs = os.path.join(stage_dir, 'outputs')
         artifacts = []
-        if os.path.isdir(outs):
-            for root, _, files in os.walk(outs):
-                for fn in files:
-                    full = os.path.join(root, fn)
-                    rel = os.path.relpath(full, match.fdir)
-                    artifacts.append({
-                        'path': rel,
-                        'size': os.path.getsize(full),
-                        'absolute': full,
-                    })
+        for root, fn in _iter_output_files(outs):
+            full = os.path.join(root, fn)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            artifacts.append({
+                'path': os.path.relpath(full, match.fdir),
+                'size': size,
+                'absolute': full,
+            })
         return {
             'stage': stage,
             'status': match.stage_status.get(stage),
@@ -1374,6 +1375,45 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
                 'repr': proj['repr'],
                 'polarization': proj.get('polarization', polarization),
                 'energy_slice': proj.get('energy_slice', energy_slice),
+            },
+            'data': {
+                'z': data2d.tolist(),
+                'cut': cut,
+            },
+        }
+
+    @app.get('/api/ptyr_preview')
+    def _ptyr_preview(path: str,
+                      kind: str = 'obj',
+                      storage: str = '',
+                      mode: int = 0,
+                      repr: str = 'amplitude',
+                      row: int = -1,
+                      col: int = -1,
+                      target_max: int = 512):
+        if not _safe_under(path, app.state.registry.root):
+            raise HTTPException(status_code=400, detail='path escape')
+        from . import ptypy_loaders
+        summary = ptypy_loaders.summarize(path)
+        if 'error' in summary:
+            return {'kind': 'error', 'data': summary['error'],
+                    'meta': {'path': path}}
+        proj = ptypy_loaders.project(path, kind=kind,
+                                     storage=(storage or None),
+                                     mode=mode, repr_=repr)
+        if 'error' in proj:
+            return {'kind': 'error', 'data': proj['error'],
+                    'meta': {'path': path}}
+        data2d, (sy, sx) = ptypy_loaders.downsample(proj['data'], target_max)
+        cut = ptypy_loaders.cuts(data2d, row=row, col=col)
+        return {
+            'kind': 'ptyr_preview',
+            'meta': {
+                'path': path,
+                'storages': summary['storages'],
+                'iter_info': summary.get('iter_info', {}),
+                'downsampled': [sy, sx],
+                **proj['meta'],
             },
             'data': {
                 'z': data2d.tolist(),
@@ -1439,6 +1479,31 @@ def _read_stage_meta(fdir: str, st_name: str) -> dict:
         return {}
 
 
+def _iter_output_files(outs: str):
+    """Yield (root, filename) pairs under `outs`, following symlinked dirs.
+
+    `ctx.artifact()` can register a whole directory by symlinking it into
+    `outputs/<relpath>`; we follow those so the underlying tree shows up
+    as artifacts. A canonical-path set guards against infinite loops if
+    a symlink target ends up containing `outs`.
+    """
+    if not os.path.isdir(outs):
+        return
+    seen: set = set()
+    for root, dirs, files in os.walk(outs, followlinks=True):
+        try:
+            real = os.path.realpath(root)
+        except OSError:
+            dirs[:] = []
+            continue
+        if real in seen:
+            dirs[:] = []
+            continue
+        seen.add(real)
+        for fn in files:
+            yield root, fn
+
+
 def _stage_summaries(record) -> list[dict]:
     out = []
     stages_dir = os.path.join(record.fdir, 'stages')
@@ -1446,8 +1511,7 @@ def _stage_summaries(record) -> list[dict]:
         return out
     for st_name in sorted(os.listdir(stages_dir)):
         outs = os.path.join(stages_dir, st_name, 'outputs')
-        artifacts = sum(len(fs) for _, _, fs in os.walk(outs)) \
-            if os.path.isdir(outs) else 0
+        artifacts = sum(1 for _ in _iter_output_files(outs))
         meta = _read_stage_meta(record.fdir, st_name)
         started, ended = meta.get('started'), meta.get('ended')
         out.append({

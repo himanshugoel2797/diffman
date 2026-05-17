@@ -61,6 +61,14 @@ def render(path: str, *, max_bytes: int = 4_000_000) -> dict:
             meta['srw'] = True
             return {'kind': 'srw', 'data': None, 'meta': meta}
 
+        # PtyPy .ptyr reconstruction sniff — same lazy pattern as SRW: a
+        # marker payload here, with /api/ptyr_preview doing the actual
+        # array read on demand.
+        from . import ptypy_loaders
+        if ptypy_loaders.is_ptyr_file(path):
+            meta['ptyr'] = True
+            return {'kind': 'ptyr', 'data': None, 'meta': meta}
+
         if ext in {'.png', '.jpg', '.jpeg', '.gif', '.svg'}:
             return _render_image(path, meta)
         if ext == '.npy':
