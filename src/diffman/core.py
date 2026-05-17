@@ -80,6 +80,54 @@ def _mpi_rank() -> int:
     return 0
 
 
+def mpi_barrier() -> None:
+    """Wait for every MPI rank to reach this point.
+
+    No-op when the host program has not already imported `mpi4py` — we
+    never trigger the import ourselves, since `import mpi4py.MPI` calls
+    `MPI_Init` as a side effect and would silently flip a single-process
+    run into an MPI run.
+
+    Intended pairing: a rank-0-only file write followed by `mpi_barrier()`
+    so the other ranks don't race ahead and read a half-written file.
+    """
+    import sys
+    if 'mpi4py.MPI' not in sys.modules and 'mpi4py' not in sys.modules:
+        return
+    try:
+        from mpi4py import MPI
+        if MPI.Is_initialized() and not MPI.Is_finalized():
+            MPI.COMM_WORLD.Barrier()
+    except Exception:
+        #A barrier failure should never crash the host program — the
+        #worst case is a subsequent racy file read, which is the same
+        #behavior the caller would have had without the barrier.
+        pass
+
+
+def mpi_rank() -> int:
+    """Public wrapper around `_mpi_rank()` for stage authors writing
+    MPI-aware pipelines. See `_mpi_rank` for detection details."""
+    return _mpi_rank()
+
+
+def _clear_path(p: str) -> None:
+    """Remove `p` if it exists, handling files, symlinks, and directories.
+
+    Used before atomic-ish file creation (``ctx.artifact`` symlink / copy)
+    to guarantee a clean slate. Errors are swallowed — the caller is
+    about to attempt creation anyway and will get a more useful exception
+    from that.
+    """
+    if os.path.islink(p) or os.path.isfile(p):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    elif os.path.isdir(p):
+        shutil.rmtree(p, ignore_errors=True)
+
+
 def _try_snapshot(root: str, source_file: str, message: str) -> None:
     """Best-effort git snapshot of a pipeline / chain source file.
 
@@ -795,23 +843,35 @@ class RunContext:
         ``stages/<stage>/outputs/<relpath>`` so diffman can serve it.
         Symlinks when supported, falls back to copy / copytree otherwise.
         Returns the destination path.
+
+        Under MPI only rank 0 writes; other ranks compute and return the
+        destination path without touching the filesystem. This avoids the
+        classic race where every rank tries to ``os.symlink`` the same
+        target and all but one trip ``FileExistsError`` in the copy
+        fallback. Callers that only need ``dest`` (logging / pickling)
+        are unaffected; callers that read from ``dest`` should already be
+        synchronizing on rank 0 finishing the stage.
         """
         src = os.path.abspath(source)
         if not os.path.exists(src):
             raise FileNotFoundError(
                 f'artifact source does not exist: {source}')
         dest = os.path.join(self.stage_dir(stage_name), 'outputs', relpath)
+        if _mpi_rank() != 0:
+            return dest
         os.makedirs(os.path.dirname(dest) or '.', exist_ok=True)
-        if os.path.islink(dest) or os.path.isfile(dest):
-            os.unlink(dest)
-        elif os.path.isdir(dest):
-            shutil.rmtree(dest)
+        _clear_path(dest)
         try:
             os.symlink(src, dest)
         except OSError:
-            #Symlinks unsupported (Windows without privilege, exotic FS);
-            #fall back to a real copy.
-            (shutil.copytree if os.path.isdir(src) else shutil.copy2)(src, dest)
+            #Symlinks unsupported (Windows without privilege, exotic FS)
+            #or a partial entry was left behind by the failed call —
+            #clear it and fall back to a real copy.
+            _clear_path(dest)
+            if os.path.isdir(src):
+                shutil.copytree(src, dest)
+            else:
+                shutil.copy2(src, dest)
         return dest
 
     def metric(self, stage_name: str, name: str, value) -> None:
@@ -823,7 +883,12 @@ class RunContext:
         non-dict / malformed JSON at the path is reset rather than raised
         so a corrupt write from a prior crash doesn't poison further
         metric() calls.
+
+        Under MPI only rank 0 writes — the read-modify-write would race
+        otherwise and silently lose entries from concurrent ranks.
         """
+        if _mpi_rank() != 0:
+            return
         path = Path(self.stage_dir(stage_name), 'metrics.json')
         data: dict = {}
         if path.exists():

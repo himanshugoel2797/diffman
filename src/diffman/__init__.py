@@ -15,6 +15,8 @@ from .core import (
     fingerprint,
     register,
     registry,
+    mpi_rank,
+    mpi_barrier,
 )
 from .discovery import discover, load_module
 
@@ -24,6 +26,7 @@ __all__ = [
     'Chain', 'ChainStep', 'Variation',
     'RunRegistry', 'RunContext', 'RunRecord',
     'fingerprint', 'register', 'registry',
+    'mpi_rank', 'mpi_barrier',
     'discover', 'load_module',
 ]
 

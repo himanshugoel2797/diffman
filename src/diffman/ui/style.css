@@ -189,6 +189,16 @@ button.ghost {
 .diff-kind.only_in_child  { background: var(--info); }
 .diff-kind.only_in_parent { background: var(--neutral); }
 
+table.runs-table { border-collapse: collapse; width: 100%; font-size: 12px;
+                    margin-top: 4px; }
+.runs-table th, .runs-table td {
+  text-align: left; padding: 3px 10px; border-bottom: 1px solid #e5ebef;
+  font-family: ui-monospace, monospace; vertical-align: middle;
+}
+.runs-table th { color: #666; font-weight: 600; font-size: 11px; }
+.runs-table a { color: var(--accent); text-decoration: none; }
+.runs-table a:hover { text-decoration: underline; }
+
 table.diff-table { border-collapse: collapse; width: 100%; font-size: 12px; }
 .diff-table th, .diff-table td {
   text-align: left; padding: 3px 8px; border-bottom: 1px solid #e5ebef;

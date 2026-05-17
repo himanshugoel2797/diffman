@@ -216,14 +216,66 @@ const App = {
       main.appendChild(el('p', {class: 'hint', text: 'root pipeline (no parent declared)'}));
     }
 
+    //Runs in this pipeline (RunRecord.pipeline is the Pipeline.name, not
+    //the module). `this.allRuns` is kept fresh by the periodic refresh.
+    const pipeRuns = (this.allRuns || [])
+      .filter(r => r.pipeline === diff.pipeline);
+    const runsByVariant = {};
+    for (const r of pipeRuns) {
+      (runsByVariant[r.variant] = runsByVariant[r.variant] || []).push(r);
+    }
+
     const childVariants = diff.variants.filter(v => v.kind !== 'only_in_parent');
     main.appendChild(el('h3', {text: `Variants (${childVariants.length})`}));
     const list = el('div', {class: 'variant-list'});
     for (const v of childVariants) {
-      list.appendChild(el('a', {href: '#', text: v.variant,
-        onclick: ev => { ev.preventDefault(); this.showVariant(module, v.variant); }}));
+      const n = (runsByVariant[v.variant] || []).length;
+      const row = el('a', {href: '#',
+        onclick: ev => { ev.preventDefault(); this.showVariant(module, v.variant); }},
+        [v.variant,
+         el('span', {class: 'hint', style: 'margin-left:8px',
+           text: n ? `(${n} run${n === 1 ? '' : 's'})` : '(no runs)'})]);
+      list.appendChild(row);
     }
     main.appendChild(list);
+
+    //Recent runs section — flat list sorted by start time desc. Capped to
+    //keep the page snappy for pipelines with hundreds of runs.
+    const RUN_CAP = 25;
+    main.appendChild(el('h3', {text: `Runs (${pipeRuns.length})`}));
+    if (!pipeRuns.length) {
+      main.appendChild(el('p', {class: 'hint', text: '(no runs yet)'}));
+    } else {
+      const sorted = pipeRuns.slice().sort((a, b) =>
+        String(b.started || '').localeCompare(String(a.started || '')));
+      const shown = sorted.slice(0, RUN_CAP);
+      const tbl = el('table', {class: 'runs-table'});
+      tbl.appendChild(el('tr', {}, [
+        el('th', {text: 'variant'}), el('th', {text: 'run'}),
+        el('th', {text: 'started'}), el('th', {text: 'status'}),
+      ]));
+      for (const r of shown) {
+        const status = _runStatus(r);
+        tbl.appendChild(el('tr', {}, [
+          el('td', {}, [el('a', {href: '#', text: r.variant,
+            onclick: ev => { ev.preventDefault();
+              this.showVariant(module, r.variant); }})]),
+          el('td', {}, [el('a', {href: '#', text: r.short_fp,
+            title: r.fdir,
+            onclick: ev => { ev.preventDefault();
+              this.showRun(r.pipeline, r.variant, r.short_fp); }})]),
+          el('td', {class: 'hint', text: r.started || ''}),
+          el('td', {}, [el('span', {class: 'badge ' + status, text: status})]),
+        ]));
+      }
+      main.appendChild(tbl);
+      if (sorted.length > RUN_CAP) {
+        main.appendChild(el('p', {class: 'hint',
+          text: `(${sorted.length - RUN_CAP} older runs hidden — ` +
+                `filter by pipeline in the sidebar to see all)`}));
+      }
+    }
+
     //Refresh the sidebar so the active-pipeline highlight follows us.
     this.refresh();
   },
@@ -1799,6 +1851,19 @@ const App = {
     }
   },
 };
+
+function _runStatus(r) {
+  //Derive an overall run status from per-stage statuses. failed > running
+  //> pending > done — whichever's strongest "wins" — so a partially-
+  //failed run reads as 'failed' at a glance.
+  const ss = r.stage_status || {};
+  const vals = Object.values(ss);
+  if (!vals.length) return 'pending';
+  if (vals.some(s => s === 'failed')) return 'failed';
+  if (vals.some(s => s === 'running')) return 'running';
+  if (vals.some(s => s === 'pending')) return 'pending';
+  return 'done';
+}
 
 function renderUnifiedDiff(text) {
   //Render a unified diff with per-line coloring. Simple line-classifier.
