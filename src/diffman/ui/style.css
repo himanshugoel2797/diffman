@@ -216,48 +216,75 @@ table.compare-table {
 .compare-table th.missing { color: var(--err); text-decoration: line-through; }
 .compare-table tr.compare-differs { background: #fff5e6; }
 
-/* Chain DAG */
-.chain-dag { margin: 8px 0 16px; }
-.chain-dag-row {
-  display: flex; align-items: stretch; gap: 8px;
-  overflow-x: auto; padding: 6px 0;
+/* Chain tree view: one column per step, one row per branch lane.
+   Single-branch steps render a card that spans every lane; fan-out
+   steps render one card per lane and the inter-step connector SVG
+   draws the branching geometry. */
+.chain-tree-wrap { margin: 8px 0 16px; overflow-x: auto; padding: 6px 0; }
+.chain-tree-grid {
+  display: inline-grid;
+  column-gap: 0;        /* connectors butt up against cards on both sides */
+  row-gap: 8px;
+  align-items: stretch;
+  justify-items: stretch;
 }
-.chain-dag-arrow {
-  display: flex; align-items: center; color: #888;
-  font-size: 20px; padding: 0 4px;
+.chain-tree-header {
+  padding: 4px 6px 6px; text-align: center;
+  border-bottom: 1px solid #e2e2e2; margin-bottom: 4px;
 }
-.chain-step {
-  border: 1px solid #ddd; border-left-width: 4px;
-  background: #fff; padding: 8px 12px; border-radius: 4px;
-  min-width: 180px;
+.chain-tree-header-name {
+  font-family: ui-monospace, monospace; font-weight: 700; font-size: 13px;
 }
-.chain-step.done    { border-left-color: var(--ok); }
-.chain-step.cached  { border-left-color: var(--info); }
-.chain-step.failed  { border-left-color: var(--err); }
-.chain-step.pending { border-left-color: var(--neutral); }
-.chain-step.mixed   { border-left-color: var(--warn); }
-.chain-step.unspecified { border-left-color: var(--err); }
-.chain-step-head {
-  display: flex; gap: 8px; align-items: center; margin-bottom: 4px;
+.chain-tree-header-pipe {
+  font-family: ui-monospace, monospace; font-size: 10px; color: var(--muted);
 }
-.chain-step-name {
+.chain-tree-header-meta {
+  font-family: ui-monospace, monospace; font-size: 10px;
+  color: var(--muted); margin-top: 2px;
+}
+.chain-tree-card {
+  background: #fff; border: 1px solid #ddd; border-left-width: 4px;
+  padding: 6px 10px; border-radius: 4px;
+  display: flex; flex-direction: column; justify-content: center;
+}
+.chain-tree-card.done        { border-left-color: var(--ok); }
+.chain-tree-card.cached      { border-left-color: var(--info); }
+.chain-tree-card.failed      { border-left-color: var(--err); }
+.chain-tree-card.pending     { border-left-color: var(--neutral); }
+.chain-tree-card.mixed       { border-left-color: var(--warn); }
+.chain-tree-card.unspecified { border-left-color: var(--err); }
+.chain-tree-card-head {
+  display: flex; gap: 6px; align-items: center;
+}
+.chain-tree-card-key {
   font-family: ui-monospace, monospace; font-weight: 600;
+  font-size: 12px; color: #2a3540;
 }
-.chain-step-pipe {
-  font-family: ui-monospace, monospace; font-size: 12px; color: #555;
+.chain-tree-card-sub {
+  font-family: ui-monospace, monospace; font-size: 10px;
+  color: var(--muted); margin-top: 2px;
 }
-.chain-step-meta {
-  font-size: 11px; color: #888; margin-top: 2px;
+.chain-tree-card-meta {
+  font-family: ui-monospace, monospace; font-size: 10px;
+  margin-top: 4px;
 }
-.chain-step-meta a {
-  color: var(--info); text-decoration: none;
+.chain-tree-card-meta a { color: var(--info); text-decoration: none; }
+.chain-tree-card-meta a:hover { text-decoration: underline; }
+.chain-tree-card-meta.hint { color: #aaa; font-style: italic; }
+.chain-tree-conn {
+  display: flex; align-items: stretch; justify-content: stretch;
 }
-.chain-step-meta a:hover { text-decoration: underline; }
+/* preserveAspectRatio=none on the SVG already; just make it fill the
+   connector cell. Stroke uses a neutral color so the geometry reads
+   uniformly without competing with the per-card status borders. */
+.chain-tree-svg {
+  width: 100%; height: 100%;
+  stroke: #8a95a0; stroke-width: 2;
+  stroke-linecap: round; fill: none;
+}
 .chain-step-error {
   margin-top: 10px; border-left: 4px solid var(--err);
   background: #fff6f6; padding: 8px 12px; border-radius: 4px;
 }
 .chain-step-error h4 { margin: 0 0 6px; color: var(--err); }
-.chain-step-error pre {
-  font-size: 11px; max-height: 240px;
-}
+.chain-step-error pre { font-size: 11px; max-height: 240px; }

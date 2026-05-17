@@ -526,7 +526,9 @@ const App = {
       const node = el('div', {style: `padding-left:${depth*16}px; font-family:ui-monospace,monospace; font-size:12px`});
       const mapping = v.mapping || {};
       const summary = Object.entries(mapping)
-        .map(([k, val]) => `${k}=${val}`).join('  ');
+        .map(([k, val]) => Array.isArray(val)
+          ? `${k}=[${val.join('|')}]`   //fan-out: pipe-separated for readability
+          : `${k}=${val}`).join('  ');
       node.appendChild(el('span', {text: v.name}));
       if (v.base) {
         node.appendChild(el('span', {class: 'hint', text: ` ← ${v.base}`}));
@@ -551,53 +553,196 @@ const App = {
   },
 
   renderChainDAG(prog) {
-    //Render steps as a left-to-right row with arrow connectors. Each
-    //step is a status badge + name; click drills into the underlying
-    //run (when one exists). Failed steps show the error inline below.
-    const wrap = el('div', {class: 'chain-dag'});
-    const row = el('div', {class: 'chain-dag-row'});
-    const stepByName = {};
-    prog.steps.forEach(s => stepByName[s.name] = s);
-    prog.steps.forEach((s, i) => {
-      if (i > 0) {
-        const arrow = el('div', {class: 'chain-dag-arrow', text: '→'});
-        row.appendChild(arrow);
-      }
-      const node = el('div', {class: 'chain-step ' + (s.status || 'pending')});
-      const head = el('div', {class: 'chain-step-head'}, [
-        el('span', {class: 'badge ' + (s.status || 'pending'),
-                    text: s.status || 'pending'}),
-        el('span', {class: 'chain-step-name', text: s.name}),
-      ]);
-      node.appendChild(head);
-      node.appendChild(el('div', {class: 'chain-step-pipe',
-        text: `${s.pipeline} / ${s.variant || '?'}`}));
-      if (s.consumes && s.consumes.length) {
-        node.appendChild(el('div', {class: 'chain-step-meta',
-          text: 'consumes: ' + s.consumes.join(', ')}));
-      }
-      if (s.short_fp) {
-        node.appendChild(el('div', {class: 'chain-step-meta'}, [
-          el('a', {href: '#', text: `run [${s.short_fp}]`,
-            onclick: ev => { ev.preventDefault();
-              this.showRun(s.pipeline, s.variant, s.short_fp); }})
-        ]));
-      }
-      row.appendChild(node);
+    //Tree-style chain view: each chain step is a grid column, each
+    //branch (= "lane") is a grid row. Non-fan-out steps render one
+    //card spanning all lanes; fan-out steps render one card per lane.
+    //Between columns sits a connector cell whose SVG depends on the
+    //adjacent steps' branch shapes (1→1, 1→N, N→N, N→1), making the
+    //fan-out visually unambiguous. Failed branches surface inline below.
+    const branchesOf = s => (s.branches && s.branches.length)
+      ? s.branches
+      : [{branch_key: null, variant: s.variant, status: s.status,
+          short_fp: s.short_fp, fingerprint: s.fingerprint,
+          stage_status: s.stage_status, errors: s.errors}];
+
+    //Lanes: the set of branch_keys this variation introduces. If only
+    //null appears, the variation isn't fan-out and the tree collapses
+    //to a single-lane row of cards (visually identical to the prior
+    //flat layout for back-compat).
+    const keySet = new Set();
+    prog.steps.forEach(s => branchesOf(s).forEach(b => keySet.add(b.branch_key)));
+    const namedLanes = [...keySet].filter(k => k !== null).sort();
+    const lanes = namedLanes.length ? namedLanes : [null];
+    const nLanes = lanes.length;
+    const laneIdx = k => lanes.indexOf(k);
+
+    const stepIsFanned = s => {
+      const bs = branchesOf(s);
+      return bs.length > 1 || bs[0].branch_key !== null;
+    };
+
+    const wrap = el('div', {class: 'chain-tree-wrap'});
+    const grid = el('div', {class: 'chain-tree-grid'});
+    //Alternating column template: [step][conn][step][conn]...[step].
+    //Connector columns are narrow and fixed so the SVG geometry stays
+    //predictable when the surrounding cards wrap or grow.
+    const colTemplate = [];
+    prog.steps.forEach((_, i) => {
+      colTemplate.push('minmax(170px, max-content)');
+      if (i < prog.steps.length - 1) colTemplate.push('50px');
     });
-    wrap.appendChild(row);
-    //Inline error panels for failed steps.
-    for (const s of prog.steps) {
-      if (s.status !== 'failed') continue;
-      const errBox = el('div', {class: 'chain-step-error'});
-      errBox.appendChild(el('h4', {text: `error in ${s.name}`}));
-      for (const [stage, tb] of Object.entries(s.errors || {})) {
-        errBox.appendChild(el('p', {class: 'hint', text: `stage: ${stage}`}));
-        errBox.appendChild(el('pre', {text: tb}));
+    grid.style.gridTemplateColumns = colTemplate.join(' ');
+    //Header row + N lane rows. minmax keeps lanes aligned across cols
+    //even when cards in different columns have different content sizes.
+    grid.style.gridTemplateRows = `auto repeat(${nLanes}, minmax(64px, auto))`;
+
+    prog.steps.forEach((s, i) => {
+      const stepCol = i * 2 + 1;
+      const fanned = stepIsFanned(s);
+
+      //Per-step header above the column.
+      const hdr = el('div', {class: 'chain-tree-header'});
+      hdr.appendChild(el('div', {class: 'chain-tree-header-name', text: s.name}));
+      hdr.appendChild(el('div', {class: 'chain-tree-header-pipe', text: s.pipeline}));
+      if (s.consumes && s.consumes.length) {
+        hdr.appendChild(el('div', {class: 'chain-tree-header-meta',
+          text: '← ' + s.consumes.join(', ')}));
       }
-      wrap.appendChild(errBox);
-    }
+      hdr.style.gridColumn = stepCol;
+      hdr.style.gridRow = 1;
+      grid.appendChild(hdr);
+
+      //Step body: one spanning card or one per lane.
+      const branches = branchesOf(s);
+      if (!fanned) {
+        const card = this.renderTreeCard(s, branches[0], false);
+        card.style.gridColumn = stepCol;
+        card.style.gridRow = `2 / span ${nLanes}`;
+        grid.appendChild(card);
+      } else {
+        branches.forEach(b => {
+          const card = this.renderTreeCard(s, b, true);
+          card.style.gridColumn = stepCol;
+          card.style.gridRow = `${laneIdx(b.branch_key) + 2}`;
+          grid.appendChild(card);
+        });
+      }
+
+      //Connector to the next step.
+      if (i < prog.steps.length - 1) {
+        const next = prog.steps[i + 1];
+        const conn = this.renderTreeConnector(
+          fanned, stepIsFanned(next), nLanes);
+        conn.style.gridColumn = stepCol + 1;
+        conn.style.gridRow = `2 / span ${nLanes}`;
+        grid.appendChild(conn);
+      }
+    });
+
+    wrap.appendChild(grid);
+
+    //Inline per-branch error panels — fan-out variations regularly
+    //have one branch fail while siblings succeed, so each gets its own.
+    prog.steps.forEach(s => {
+      branchesOf(s).forEach(b => {
+        if (b.status !== 'failed') return;
+        const label = b.branch_key !== null
+          ? `${s.name}[${b.branch_key}]` : s.name;
+        const errBox = el('div', {class: 'chain-step-error'});
+        errBox.appendChild(el('h4', {text: `error in ${label}`}));
+        for (const [stage, tb] of Object.entries(b.errors || {})) {
+          errBox.appendChild(el('p', {class: 'hint', text: `stage: ${stage}`}));
+          errBox.appendChild(el('pre', {text: tb}));
+        }
+        wrap.appendChild(errBox);
+      });
+    });
     return wrap;
+  },
+
+  renderTreeCard(step, b, isFanned) {
+    const status = b.status || 'pending';
+    const card = el('div', {class: 'chain-tree-card ' + status});
+
+    const head = el('div', {class: 'chain-tree-card-head'});
+    head.appendChild(el('span', {class: 'badge ' + status, text: status}));
+    //Branch key as the primary identifier for fanned cards; for
+    //single-branch cards the variant takes that role.
+    const primary = isFanned && b.branch_key !== null
+      ? b.branch_key : (b.variant || '?');
+    head.appendChild(el('span', {class: 'chain-tree-card-key', text: primary}));
+    card.appendChild(head);
+
+    //When the branch was inherited from a fanned upstream (branch_key !=
+    //variant), surface the underlying variant so it's not hidden — the
+    //user needs to see e.g. that recon_analysis[aps_2mode] ran the
+    //'default' variant.
+    if (isFanned && b.branch_key !== null && b.variant
+        && b.variant !== b.branch_key) {
+      card.appendChild(el('div', {class: 'chain-tree-card-sub',
+        text: `variant: ${b.variant}`}));
+    }
+
+    if (b.short_fp) {
+      card.appendChild(el('div', {class: 'chain-tree-card-meta'}, [
+        el('a', {href: '#', text: `[${b.short_fp}]`,
+          onclick: ev => { ev.preventDefault();
+            this.showRun(step.pipeline, b.variant, b.short_fp); }})
+      ]));
+    } else {
+      card.appendChild(el('div', {class: 'chain-tree-card-meta hint',
+        text: status === 'pending' ? '(no run yet)' : ''}));
+    }
+    return card;
+  },
+
+  renderTreeConnector(fromMulti, toMulti, nLanes) {
+    //SVG connector with preserveAspectRatio="none" so lines stretch
+    //smoothly to whatever the surrounding grid produces. The viewBox
+    //uses 100 units per lane vertically so the arithmetic below stays
+    //the same shape regardless of how the cells actually size.
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+    const W = 50;
+    const LH = 100;
+    const H = Math.max(1, nLanes) * LH;
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    svg.setAttribute('preserveAspectRatio', 'none');
+    svg.setAttribute('class', 'chain-tree-svg');
+    const laneY = i => i * LH + LH / 2;
+    const line = (x1, y1, x2, y2) => {
+      const l = document.createElementNS(SVG_NS, 'line');
+      l.setAttribute('x1', x1); l.setAttribute('y1', y1);
+      l.setAttribute('x2', x2); l.setAttribute('y2', y2);
+      return l;
+    };
+    if (!fromMulti && !toMulti) {
+      svg.appendChild(line(0, H / 2, W, H / 2));
+    } else if (!fromMulti && toMulti) {
+      //1→N: stub from prev, vertical trunk, one branch per lane.
+      svg.appendChild(line(0, H / 2, W / 2, H / 2));
+      svg.appendChild(line(W / 2, laneY(0), W / 2, laneY(nLanes - 1)));
+      for (let i = 0; i < nLanes; i++) {
+        svg.appendChild(line(W / 2, laneY(i), W, laneY(i)));
+      }
+    } else if (fromMulti && toMulti) {
+      //N→N: parallel arrows, one per lane.
+      for (let i = 0; i < nLanes; i++) {
+        svg.appendChild(line(0, laneY(i), W, laneY(i)));
+      }
+    } else {
+      //N→1: merge mirror of fan-out (defensive — current chains don't
+      //merge, but a downstream consuming multiple branched upstreams
+      //via a non-fanned variant would land here).
+      for (let i = 0; i < nLanes; i++) {
+        svg.appendChild(line(0, laneY(i), W / 2, laneY(i)));
+      }
+      svg.appendChild(line(W / 2, laneY(0), W / 2, laneY(nLanes - 1)));
+      svg.appendChild(line(W / 2, H / 2, W, H / 2));
+    }
+    const cell = el('div', {class: 'chain-tree-conn'});
+    cell.appendChild(svg);
+    return cell;
   },
 
   async showChainDiff(name) {

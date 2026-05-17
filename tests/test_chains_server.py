@@ -847,3 +847,92 @@ class TestChainOnlyModuleInPipelineEndpoint:
         #chain-only module just because it lacks a PIPELINE attribute.
         for n in pipes:
             assert n.get('error') != 'no PIPELINE attribute'
+
+
+# ---------------------------------------------------------------------------
+# Fan-out variations: per-branch progress + scoreboard rows
+# ---------------------------------------------------------------------------
+
+CHAIN_FANOUT = """
+    import diffman as dm
+    import _diffman_chain_fwd as forward_mod
+    import _diffman_chain_recon as recon_mod
+
+    CHAIN = dm.Chain('fanchain', steps=[
+        dm.ChainStep('forward', forward_mod.PIPELINE),
+        dm.ChainStep('recon',   recon_mod.PIPELINE, consumes=('forward',)),
+    ])
+    CHAIN.variation('plain', forward='base', recon='ePIE')
+    CHAIN.variation('sweep', forward='base', recon=['ePIE', 'DM'])
+"""
+
+
+@pytest.fixture
+def fanout_client(scan_root, make_pipeline):
+    make_pipeline('_diffman_chain_fwd',   PIPELINE_FORWARD)
+    make_pipeline('_diffman_chain_recon', PIPELINE_RECON)
+    make_pipeline('_diffman_chain_fan',   CHAIN_FANOUT)
+    app = create_app(root=str(scan_root / 'runs'),
+                     scan_root=str(scan_root), no_scan=False)
+    with TestClient(app) as c:
+        yield c, scan_root
+
+
+class TestChainProgressFanout:
+    def test_single_branch_step_still_has_one_branch_entry(self, fanout_client):
+        """Non-fan-out variations get `branches` as a one-element list
+        with branch_key=None — the wire shape is uniform so the UI
+        doesn't need a special case."""
+        c, _ = fanout_client
+        d = c.get('/api/chain_progress/fanchain/plain').json()
+        for s in d['steps']:
+            assert 'branches' in s
+            assert len(s['branches']) == 1
+            assert s['branches'][0]['branch_key'] is None
+
+    def test_fanout_step_exposes_one_branch_per_variant(self, fanout_client, scan_root):
+        c, _ = fanout_client
+        from diffman import RunRegistry
+        from diffman.discovery import load_module
+        mod = load_module('_diffman_chain_fan')
+        rr = RunRegistry(root=str(scan_root / 'runs'))
+        mod.CHAIN.variations['sweep'].run(rr)
+        d = c.get('/api/chain_progress/fanchain/sweep').json()
+        recon = next(s for s in d['steps'] if s['name'] == 'recon')
+        keys = sorted(b['branch_key'] for b in recon['branches'])
+        assert keys == ['DM', 'ePIE']
+        for b in recon['branches']:
+            assert b['variant'] == b['branch_key']
+            assert b['short_fp'] is not None
+            assert b['status'] in ('done', 'cached')
+
+    def test_fanout_branches_have_distinct_fingerprints(self, fanout_client, scan_root):
+        c, _ = fanout_client
+        from diffman import RunRegistry
+        from diffman.discovery import load_module
+        mod = load_module('_diffman_chain_fan')
+        rr = RunRegistry(root=str(scan_root / 'runs'))
+        mod.CHAIN.variations['sweep'].run(rr)
+        d = c.get('/api/chain_progress/fanchain/sweep').json()
+        recon = next(s for s in d['steps'] if s['name'] == 'recon')
+        fps = {b['branch_key']: b['fingerprint'] for b in recon['branches']}
+        assert len(set(fps.values())) == 2
+
+    def test_scoreboard_row_per_branch(self, fanout_client, scan_root):
+        c, _ = fanout_client
+        from diffman import RunRegistry
+        from diffman.discovery import load_module
+        mod = load_module('_diffman_chain_fan')
+        rr = RunRegistry(root=str(scan_root / 'runs'))
+        mod.CHAIN.variations['sweep'].run(rr)
+        rows = c.get('/api/scoreboard/fanchain').json()['rows']
+        labels = sorted(r['variation'] for r in rows)
+        #Sweep contributes one labeled row per branch; plain contributes one.
+        assert 'plain' in labels
+        assert 'sweep[ePIE]' in labels
+        assert 'sweep[DM]' in labels
+        #Per-branch iters metric differs (ePIE=100, DM=50).
+        sweep_epie = next(r for r in rows if r['variation'] == 'sweep[ePIE]')
+        sweep_dm = next(r for r in rows if r['variation'] == 'sweep[DM]')
+        assert sweep_epie['metrics']['recon.recon.iters_done'] == 100
+        assert sweep_dm['metrics']['recon.recon.iters_done'] == 50

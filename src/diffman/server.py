@@ -185,10 +185,17 @@ def _resolve_variation_runs(chain, variation, all_runs) -> dict:
     runs: dict = {s.name: None for s in chain.steps}
     upstream_fps: dict = {}
     for step in chain.steps:
-        variant_name = mapping.get(step.name)
-        if variant_name is None:
+        spec = mapping.get(step.name)
+        if spec is None:
             upstream_fps[step.name] = None
             continue
+        #Fan-out variations bind a step to a list of variants. The
+        #single-record-per-step view this helper exposes can't represent
+        #all branches, so we pick the first variant — enough for the
+        #non-fan-out case (identical behavior) and a graceful fallback
+        #for the fan-out case until the UI grows per-branch support.
+        variant_name = (spec[0] if isinstance(spec, (list, tuple))
+                        else spec)
         required = {u: upstream_fps.get(u) for u in step.consumes}
         if any(v is None for v in required.values()):
             upstream_fps[step.name] = None
@@ -203,6 +210,81 @@ def _resolve_variation_runs(chain, variation, all_runs) -> dict:
         else:
             upstream_fps[step.name] = None
     return runs
+
+
+def _resolve_variation_branches(chain, variation, all_runs) -> dict:
+    """Per-branch counterpart to ``_resolve_variation_runs``.
+
+    For every step in `chain`, returns a list of one entry per branch:
+    ``[{'branch_key', 'variant', 'run'}, ...]``. Non-fan-out steps (and
+    steps that don't inherit fan-out from upstream) get a single entry
+    with ``branch_key=None`` — so callers can always iterate the list.
+
+    Branch-key resolution mirrors ``Chain._run``: if the variation maps
+    a step to ``list[str]``, the step fans out into those variants; a
+    downstream step inherits keys from its consumed steps. The matched
+    run for each branch joins on the upstream branch's run fingerprint,
+    same upstream-fp join the single-record resolver does.
+    """
+    mapping = variation.resolve()
+    branches: dict = {}    #step_name -> list[branch_dict]
+    upstream_fps: dict = {}    #step_name -> dict[branch_key, fp | None]
+
+    for step in chain.steps:
+        spec = mapping.get(step.name)
+        if spec is None:
+            branches[step.name] = [
+                {'branch_key': None, 'variant': None, 'run': None}]
+            upstream_fps[step.name] = {None: None}
+            continue
+
+        if isinstance(spec, (list, tuple)):
+            variants = list(spec)
+            keys_to_variant = {v: v for v in variants}
+        else:
+            #Branch keys may still come from a consumed upstream.
+            inherited: list = [None]
+            for u in step.consumes:
+                ks = list(upstream_fps.get(u, {None: None}).keys())
+                if ks == [None]:
+                    continue
+                if inherited == [None]:
+                    inherited = ks
+                elif set(inherited) != set(ks):
+                    #Mismatched inherited keys would be a hard error at
+                    #execution; here we surface a single pending entry
+                    #per declared variant so the UI can still render.
+                    inherited = ks
+            keys_to_variant = {k: spec for k in inherited}
+
+        entries: list = []
+        fps_for_step: dict = {}
+        for bk, vname in keys_to_variant.items():
+            required = {}
+            ready = True
+            for u in step.consumes:
+                up_fps = upstream_fps.get(u, {None: None})
+                if list(up_fps.keys()) == [None]:
+                    required[u] = up_fps[None]
+                else:
+                    required[u] = up_fps.get(bk)
+                if required[u] is None:
+                    ready = False
+            run = None
+            if ready:
+                for r in all_runs:
+                    if (r.pipeline == step.pipeline.name
+                            and r.variant == vname
+                            and r.upstream == required):
+                        run = r
+                        break
+            entries.append({'branch_key': bk, 'variant': vname, 'run': run})
+            fps_for_step[bk] = run.fingerprint if run else None
+
+        branches[step.name] = entries
+        upstream_fps[step.name] = fps_for_step
+
+    return branches
 
 
 def _summarize_stage_status(stage_status: dict) -> str:
@@ -301,20 +383,41 @@ def _scoreboard_rows(chain, all_runs) -> tuple[list[dict], set[str]]:
     all_metric_keys: set[str] = set()
     for var_name, var in chain.variations.items():
         try:
-            matched = _resolve_variation_runs(chain, var, all_runs)
+            branches = _resolve_variation_branches(chain, var, all_runs)
         except KeyError:
             continue   #malformed variation (e.g. unresolved base=)
-        flat: dict = {}
-        for step in chain.steps:
-            run = matched[step.name]
-            if run is None:
-                continue
-            for st_name, st_metrics in _load_stage_metrics(run.fdir):
-                for k, v in st_metrics.items():
-                    key = f'{step.name}.{st_name}.{k}'
-                    flat[key] = v
-                    all_metric_keys.add(key)
-        rows.append({'variation': var_name, 'metrics': flat})
+
+        #Discover the variation's branch-key set from any fan-out step
+        #(all fan-out keys agree by Chain._run's inheritance rule). A
+        #variation that doesn't fan out gets a single None-keyed row.
+        branch_keys: list = [None]
+        for entries in branches.values():
+            keys = [e['branch_key'] for e in entries]
+            if keys != [None]:
+                branch_keys = keys
+                break
+
+        for bk in branch_keys:
+            flat: dict = {}
+            for step in chain.steps:
+                step_entries = branches[step.name]
+                #If this step itself doesn't fan out, it still has a
+                #single None-keyed entry that's shared across all
+                #branch rows; otherwise pick the entry matching bk.
+                if len(step_entries) == 1 and step_entries[0]['branch_key'] is None:
+                    entry = step_entries[0]
+                else:
+                    entry = next((e for e in step_entries
+                                  if e['branch_key'] == bk), None)
+                if entry is None or entry['run'] is None:
+                    continue
+                for st_name, st_metrics in _load_stage_metrics(entry['run'].fdir):
+                    for k, v in st_metrics.items():
+                        key = f'{step.name}.{st_name}.{k}'
+                        flat[key] = v
+                        all_metric_keys.add(key)
+            label = var_name if bk is None else f'{var_name}[{bk}]'
+            rows.append({'variation': label, 'metrics': flat})
     return rows, all_metric_keys
 
 
@@ -526,7 +629,17 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
     # --- static SPA ------------------------------------------------------
     @app.get('/', response_class=HTMLResponse)
     def _index():
-        return (ui_dir / 'index.html').read_text()
+        #Rewrite static asset URLs to include a mtime cache-buster, so
+        #edits to app.js / style.css land immediately on next page load
+        #instead of waiting for the browser's heuristic revalidation.
+        html = (ui_dir / 'index.html').read_text()
+        for asset in ('app.js', 'style.css'):
+            try:
+                v = int((ui_dir / asset).stat().st_mtime)
+            except OSError:
+                continue
+            html = html.replace(f'/static/{asset}', f'/static/{asset}?v={v}')
+        return html
 
     # --- pipeline graph --------------------------------------------------
     @app.get('/api/pipelines')
@@ -850,13 +963,33 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
             mapping = chain.variations[variation].resolve()
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
+        all_runs = app.state.registry.list_runs()
         matched = _resolve_variation_runs(
-            chain, chain.variations[variation],
-            app.state.registry.list_runs())
+            chain, chain.variations[variation], all_runs)
+        per_branch = _resolve_variation_branches(
+            chain, chain.variations[variation], all_runs)
         steps = []
         for step in chain.steps:
             variant_name = mapping.get(step.name)
             r = matched[step.name]
+            #Per-branch view for fan-out / inherited fan-out steps. For
+            #plain single-branch steps this is still a one-element list
+            #(branch_key=None), so the UI can render uniformly.
+            branch_payload = []
+            for entry in per_branch[step.name]:
+                br = entry['run']
+                br_status = ('unspecified' if entry['variant'] is None
+                             else _summarize_stage_status(br.stage_status)
+                             if br is not None else 'pending')
+                branch_payload.append({
+                    'branch_key': entry['branch_key'],
+                    'variant': entry['variant'],
+                    'status': br_status,
+                    'short_fp': br.fingerprint[:12] if br else None,
+                    'fingerprint': br.fingerprint if br else None,
+                    'stage_status': dict(br.stage_status) if br else {},
+                    'errors': dict(br.errors) if br else {},
+                })
             steps.append({
                 'name': step.name, 'pipeline': step.pipeline.name,
                 'variant': variant_name, 'consumes': list(step.consumes),
@@ -867,6 +1000,7 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
                 'fingerprint': r.fingerprint if r else None,
                 'stage_status': dict(r.stage_status) if r else {},
                 'errors': dict(r.errors) if r else {},
+                'branches': branch_payload,
             })
         return {'chain': name, 'variation': variation, 'steps': steps}
 

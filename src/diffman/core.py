@@ -458,13 +458,21 @@ class Variation:
         (raising if they aren't fully cached) and downstream steps are
         skipped. Used to invoke each step under its own ``srun``
         geometry from a single entry-point script.
+
+        ``step="<name>:<branch>"`` further restricts execution to one
+        branch of a fan-out step (or one branch inherited from a fan-out
+        upstream), so each branch can be dispatched under its own srun.
         """
         only = None
+        only_branch = None
         if step is not None and step != '':
+            spec = step
+            if isinstance(spec, str) and ':' in spec:
+                spec, only_branch = spec.split(':', 1)
             steps = self.chain.steps
-            if isinstance(step, int) or (isinstance(step, str)
-                                         and step.lstrip('-').isdigit()):
-                idx = int(step)
+            if isinstance(spec, int) or (isinstance(spec, str)
+                                         and spec.lstrip('-').isdigit()):
+                idx = int(spec)
                 if not 0 <= idx < len(steps):
                     raise IndexError(
                         f'chain step index {idx} out of range '
@@ -473,12 +481,13 @@ class Variation:
                 only = steps[idx].name
             else:
                 names = [s.name for s in steps]
-                if step not in names:
+                if spec not in names:
                     raise KeyError(
-                        f'chain step {step!r} not found in chain '
+                        f'chain step {spec!r} not found in chain '
                         f'{self.chain.name!r}; known steps: {names}')
-                only = step
-        return self.chain._run(self, run_registry, only_step=only)
+                only = spec
+        return self.chain._run(self, run_registry,
+                               only_step=only, only_branch=only_branch)
 
 
 class Chain:
@@ -530,8 +539,9 @@ class Chain:
         return v
 
     def _run(self, variation: Variation, rr: 'RunRegistry', *,
-             only_step: Optional[str] = None) -> dict:
-        """Execute the chain (or a single step of it).
+             only_step: Optional[str] = None,
+             only_branch: Optional[str] = None) -> dict:
+        """Execute the chain (or a single step / branch of it).
 
         With ``only_step`` set to a step name, every step *up to and
         including* the target is entered, but the steps before it are
@@ -540,6 +550,21 @@ class Chain:
         normally; steps after it are not entered. Downstream code that
         needs all steps' ``RunRecord``s should call without
         ``only_step``.
+
+        A variation's step mapping may bind a step to ``list[str]`` of
+        variant names instead of a single ``str`` — that step then
+        fans out into one branch per variant, and downstream steps that
+        consume it inherit the same branch keys (one run per branch).
+        ``only_branch`` restricts execution to a single branch (matched
+        either at the targeted step itself or any cached upstream).
+
+        Returns ``{step_name: RunRecord}`` (legacy shape) when no step
+        in this variation fans out, otherwise ``{step_name: {branch_key:
+        RunRecord}}`` — branch keys are the variant names for fan-out
+        steps and the inherited keys for downstream steps that consume
+        them. Callers that want a uniform shape can normalize via
+        ``{k: (v if isinstance(v, dict) else {None: v}) for k, v in
+        runs.items()}``.
         """
         mapping = variation.resolve()
         if self._source_file:
@@ -551,31 +576,114 @@ class Chain:
                 raise KeyError(
                     f'chain step {only_step!r} not in chain '
                     f'{self.name!r}; known steps: {names}')
-        runs: dict[str, RunRecord] = {}
+
+        runs: dict[str, dict[Optional[str], RunRecord]] = {}
         for step in self.steps:
             if step.name not in mapping:
                 raise KeyError(
                     f'variation {variation.name!r} does not specify '
                     f'a variant for step {step.name!r}')
+            spec = mapping[step.name]
+            if isinstance(spec, (list, tuple)):
+                variants = list(spec)
+                if not variants:
+                    raise ValueError(
+                        f'variation {variation.name!r}: step '
+                        f'{step.name!r} has empty variant list')
+                if len(set(variants)) != len(variants):
+                    raise ValueError(
+                        f'variation {variation.name!r}: step '
+                        f'{step.name!r} has duplicate variants in '
+                        f'fan-out list {variants}')
+                is_fanout = True
+            elif isinstance(spec, str):
+                variants = [spec]
+                is_fanout = False
+            else:
+                raise TypeError(
+                    f'variation {variation.name!r}: step {step.name!r} '
+                    f'variant must be str or list[str], got '
+                    f'{type(spec).__name__}')
+
+            #Branch keys carried in from upstream. Two consumed steps
+            #that fan out independently is an unsupported composition
+            #(the cartesian product is rarely what callers want and
+            #masks bugs), so we require their keys to match.
+            inherited: Optional[list] = None
+            inherited_src: Optional[str] = None
+            for u in step.consumes:
+                up_runs = runs[u]
+                ks = list(up_runs.keys())
+                if ks == [None]:
+                    continue
+                if inherited is None:
+                    inherited = ks
+                    inherited_src = u
+                elif set(inherited) != set(ks):
+                    raise ValueError(
+                        f'step {step.name!r}: consumed upstreams '
+                        f'{inherited_src!r} and {u!r} have different '
+                        f'branch keys ({inherited} vs {ks})')
+
+            if is_fanout and inherited is not None:
+                raise ValueError(
+                    f'step {step.name!r}: cannot fan out — already '
+                    f'inherits branch keys {inherited} from upstream '
+                    f'{inherited_src!r}; place the fan-out further '
+                    f'upstream or use a separate chain variation')
+
+            if is_fanout:
+                branch_keys = variants
+                branch_variant = {v: v for v in variants}
+            elif inherited is not None:
+                branch_keys = list(inherited)
+                branch_variant = {k: variants[0] for k in branch_keys}
+            else:
+                branch_keys = [None]
+                branch_variant = {None: variants[0]}
+
+            if only_branch is not None and only_branch in branch_keys:
+                effective_keys = [only_branch]
+            elif (only_step == step.name and only_branch is not None):
+                raise KeyError(
+                    f'branch {only_branch!r} not found for step '
+                    f'{step.name!r}; available branches: {branch_keys}')
+            else:
+                effective_keys = branch_keys
+
             module = step.pipeline._module
             if module is None:
                 raise RuntimeError(
                     f'pipeline {step.pipeline.name!r} has no module '
-                    f'attribution; cannot resolve variant '
-                    f'{mapping[step.name]!r} from the registry')
-            #When targeting a single step, resolve upstream steps from
-            #their on-disk cache instead of re-executing them — that
-            #keeps the runtime geometry of this srun appropriate for
-            #the *target* step only.
+                    f'attribution; cannot resolve variant from the '
+                    f'registry')
+
             assume_cached = (only_step is not None
                              and step.name != only_step)
-            runs[step.name] = step.pipeline.run(
-                registry.get(module, mapping[step.name]), rr,
-                upstream={u: runs[u] for u in step.consumes},
-                chain=self.name, variation=variation.name,
-                assume_cached=assume_cached)
+            step_runs: dict[Optional[str], RunRecord] = {}
+            for bk in effective_keys:
+                v_name = branch_variant[bk]
+                up_records = {}
+                for u in step.consumes:
+                    up_dict = runs[u]
+                    if list(up_dict.keys()) == [None]:
+                        up_records[u] = up_dict[None]
+                    else:
+                        up_records[u] = up_dict[bk]
+                step_runs[bk] = step.pipeline.run(
+                    registry.get(module, v_name), rr,
+                    upstream=up_records,
+                    chain=self.name, variation=variation.name,
+                    assume_cached=assume_cached)
+            runs[step.name] = step_runs
             if step.name == only_step:
                 break
+
+        #Preserve the legacy `{step: RunRecord}` shape when nothing fans
+        #out — keeps existing callers (and tests) unchanged. Fan-out
+        #variations return the nested `{step: {branch: RunRecord}}`.
+        if all(list(d.keys()) == [None] for d in runs.values()):
+            return {k: d[None] for k, d in runs.items()}
         return runs
 
 

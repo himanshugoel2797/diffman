@@ -336,3 +336,208 @@ def test_pipeline_run_snapshot_uses_run_fp_not_variant_fp(tmp_path,
     assert proc_short in proc_snap[0]
     #When upstream changes the run fp, it diverges from the variant fp.
     assert proc_short != proc_variant_short
+
+
+# ---------------------------------------------------------------------------
+# Fan-out: a chain variation can bind a step to a list of variants
+# ---------------------------------------------------------------------------
+
+def _build_fanout_chain(tmp_path, monkeypatch):
+    """Same two-pipeline shape as _build_two_pipeline_chain, but with
+    three downstream variants so the variation can fan out the `process`
+    step into [a, b, c]."""
+    monkeypatch.syspath_prepend(str(tmp_path))
+    dm.registry._variants.clear()
+
+    dm.registry.register('base', module='upstream', n=1)
+
+    def _up(ctx):
+        out = os.path.join(tmp_path, f'up_{ctx.variant.name}.txt')
+        Path(out).write_text(str(ctx.variant.config['n']))
+        ctx.artifact('sim', 'value.txt', out)
+        return {}
+
+    up_pipe = dm.Pipeline('up_sim',
+                          [dm.Stage('sim', _up, config_keys=('n',))],
+                          module='upstream')
+
+    for name, mult in [('a', 2), ('b', 3), ('c', 5)]:
+        dm.registry.register(name, module='downstream', mult=mult)
+
+    def _down(ctx):
+        src = ctx.upstream_artifact('forward', 'stages/sim/outputs/value.txt')
+        n = int(Path(src).read_text())
+        out = os.path.join(tmp_path, f'down_{ctx.variant.name}.txt')
+        Path(out).write_text(str(n * ctx.variant.config['mult']))
+        ctx.artifact('proc', 'doubled.txt', out)
+        return {}
+
+    down_pipe = dm.Pipeline('down_proc',
+                            [dm.Stage('proc', _down, config_keys=('mult',))],
+                            module='downstream')
+
+    chain = dm.Chain('mychain', steps=[
+        dm.ChainStep('forward', up_pipe),
+        dm.ChainStep('process', down_pipe, consumes=('forward',)),
+    ])
+    chain.variation('sweep', forward='base', process=['a', 'b', 'c'])
+
+    rr = dm.RunRegistry(root=str(tmp_path / 'runs'))
+    return chain, rr
+
+
+def test_chain_fanout_runs_one_branch_per_variant(tmp_path, monkeypatch):
+    chain, rr = _build_fanout_chain(tmp_path, monkeypatch)
+    runs = chain.variations['sweep'].run(rr)
+    #Nested shape: the fan-out step exposes branch keys (= variant names).
+    assert set(runs['process'].keys()) == {'a', 'b', 'c'}
+    #Forward step is single-variant — still wrapped so the shape is uniform.
+    assert set(runs['forward'].keys()) == {None}
+    #Each branch ran with its own variant and produced its own output file.
+    for variant in ('a', 'b', 'c'):
+        rec = runs['process'][variant]
+        assert rec.variant == variant
+        expected = int(Path(runs['forward'][None].fdir,
+                            'stages/sim/outputs/value.txt').read_text()) \
+            * dm.registry.get('downstream', variant).config['mult']
+        assert Path(rec.fdir,
+                    'stages/proc/outputs/doubled.txt').read_text() == str(expected)
+
+
+def test_chain_fanout_branches_have_distinct_run_dirs(tmp_path, monkeypatch):
+    chain, rr = _build_fanout_chain(tmp_path, monkeypatch)
+    runs = chain.variations['sweep'].run(rr)
+    fps = {bk: rec.fingerprint for bk, rec in runs['process'].items()}
+    assert len(set(fps.values())) == 3   #all three branches distinct
+    fdirs = {bk: rec.fdir for bk, rec in runs['process'].items()}
+    assert len(set(fdirs.values())) == 3
+
+
+def test_chain_fanout_step_branch_targets_one_branch(tmp_path, monkeypatch):
+    chain, rr = _build_fanout_chain(tmp_path, monkeypatch)
+    #Prime the cache with a full run, then re-target one branch and
+    #confirm only that branch's RunRecord comes back.
+    chain.variations['sweep'].run(rr)
+    runs = chain.variations['sweep'].run(rr, step='process:b')
+    assert set(runs['process'].keys()) == {'b'}
+    #The unrelated branches are absent from this targeted result, even
+    #though they exist on disk from the priming run.
+    assert 'a' not in runs['process']
+
+
+def test_chain_fanout_missing_branch_raises(tmp_path, monkeypatch):
+    chain, rr = _build_fanout_chain(tmp_path, monkeypatch)
+    chain.variations['sweep'].run(rr)   #prime upstream caches
+    with pytest.raises(KeyError, match='branch'):
+        chain.variations['sweep'].run(rr, step='process:nonexistent')
+
+
+def test_chain_fanout_rejects_empty_variant_list(tmp_path, monkeypatch):
+    chain, rr = _build_fanout_chain(tmp_path, monkeypatch)
+    chain.variation('empty', forward='base', process=[])
+    with pytest.raises(ValueError, match='empty variant list'):
+        chain.variations['empty'].run(rr)
+
+
+def test_chain_fanout_rejects_duplicates(tmp_path, monkeypatch):
+    chain, rr = _build_fanout_chain(tmp_path, monkeypatch)
+    chain.variation('dup', forward='base', process=['a', 'a', 'b'])
+    with pytest.raises(ValueError, match='duplicate'):
+        chain.variations['dup'].run(rr)
+
+
+def test_chain_fanout_rejects_non_str_non_list_spec(tmp_path, monkeypatch):
+    chain, rr = _build_fanout_chain(tmp_path, monkeypatch)
+    chain.variation('bad', forward='base', process=42)
+    with pytest.raises(TypeError, match='must be str or list'):
+        chain.variations['bad'].run(rr)
+
+
+def test_chain_fanout_inherited_by_downstream(tmp_path, monkeypatch):
+    """A downstream step that consumes a fan-out step should inherit
+    its branch keys — one downstream run per upstream branch, even
+    though the downstream itself binds a single variant."""
+    monkeypatch.syspath_prepend(str(tmp_path))
+    dm.registry._variants.clear()
+
+    dm.registry.register('base', module='m_up', n=1)
+    for name in ('a', 'b'):
+        dm.registry.register(name, module='m_mid', tag=name)
+    dm.registry.register('only', module='m_down', kind='sum')
+
+    def _f(ctx):
+        ctx.artifact('s', 'out.txt', _write(tmp_path, ctx, 'up'))
+        return {}
+
+    def _g(ctx):
+        ctx.artifact('s', 'out.txt', _write(tmp_path, ctx, 'mid'))
+        return {}
+
+    def _h(ctx):
+        ctx.artifact('s', 'out.txt', _write(tmp_path, ctx, 'down'))
+        return {}
+
+    up = dm.Pipeline('p_up',   [dm.Stage('s', _f)], module='m_up')
+    mid = dm.Pipeline('p_mid', [dm.Stage('s', _g)], module='m_mid')
+    down = dm.Pipeline('p_down', [dm.Stage('s', _h)], module='m_down')
+
+    chain = dm.Chain('three', steps=[
+        dm.ChainStep('u', up),
+        dm.ChainStep('m', mid, consumes=('u',)),
+        dm.ChainStep('d', down, consumes=('m',)),
+    ])
+    chain.variation('v', u='base', m=['a', 'b'], d='only')
+
+    rr = dm.RunRegistry(root=str(tmp_path / 'runs'))
+    runs = chain.variations['v'].run(rr)
+    assert set(runs['m'].keys()) == {'a', 'b'}
+    assert set(runs['d'].keys()) == {'a', 'b'}    #inherited from m
+    #Both downstream branches share the same variant name but distinct
+    #fingerprints (upstream differs) → distinct run directories.
+    assert runs['d']['a'].variant == runs['d']['b'].variant == 'only'
+    assert runs['d']['a'].fingerprint != runs['d']['b'].fingerprint
+
+
+def _write(tmp_path, ctx, tag):
+    p = os.path.join(tmp_path, f'{tag}_{ctx.variant.name}.txt')
+    Path(p).write_text(tag)
+    return p
+
+
+def test_chain_fanout_double_fanout_collision_rejected(tmp_path, monkeypatch):
+    """A step that fans out AND inherits branch keys from an upstream
+    fan-out is ambiguous — cartesian product is rarely intended."""
+    monkeypatch.syspath_prepend(str(tmp_path))
+    dm.registry._variants.clear()
+    dm.registry.register('base', module='m_up')
+    for name in ('a', 'b'):
+        dm.registry.register(name, module='m_mid')
+    for name in ('x', 'y'):
+        dm.registry.register(name, module='m_down')
+
+    def _noop(ctx):
+        return {}
+
+    chain = dm.Chain('c', steps=[
+        dm.ChainStep('u', dm.Pipeline('p_u', [dm.Stage('s', _noop)], module='m_up')),
+        dm.ChainStep('m', dm.Pipeline('p_m', [dm.Stage('s', _noop)], module='m_mid'),
+                     consumes=('u',)),
+        dm.ChainStep('d', dm.Pipeline('p_d', [dm.Stage('s', _noop)], module='m_down'),
+                     consumes=('m',)),
+    ])
+    chain.variation('v', u='base', m=['a', 'b'], d=['x', 'y'])
+    rr = dm.RunRegistry(root=str(tmp_path / 'runs'))
+    with pytest.raises(ValueError, match='cannot fan out'):
+        chain.variations['v'].run(rr)
+
+
+def test_chain_fanout_legacy_shape_preserved_when_no_fanout(tmp_path,
+                                                            monkeypatch):
+    """Variations that don't fan out must still get `{step: RunRecord}`
+    back (not the nested branch dict) — the contract existing callers
+    depend on."""
+    chain, rr = _build_two_pipeline_chain(tmp_path, monkeypatch)
+    runs = chain.variations['baseline'].run(rr)
+    #The legacy shape: values are RunRecord, not dict.
+    for v in runs.values():
+        assert isinstance(v, dm.RunRecord)

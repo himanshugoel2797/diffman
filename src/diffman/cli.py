@@ -136,8 +136,17 @@ def _cmd_progress(args):
     width = max(len(s.name) for s in ch.steps)
     for step in ch.steps:
         r = matched[step.name]
-        vname = mapping.get(step.name, '?')
-        status = ('unspecified' if mapping.get(step.name) is None
+        spec = mapping.get(step.name)
+        if spec is None:
+            vname = '?'
+        elif isinstance(spec, (list, tuple)):
+            #Fan-out: matched only carries the first branch (see
+            #_resolve_variation_runs); flag the remaining branches so
+            #the user knows the row isn't the whole story.
+            vname = f'{spec[0]}(+{len(spec) - 1} more)' if len(spec) > 1 else spec[0]
+        else:
+            vname = spec
+        status = ('unspecified' if spec is None
                   else _summarize_stage_status(r.stage_status)
                   if r is not None else 'pending')
         fp = f'  [{r.fingerprint[:12]}]' if r else ''
