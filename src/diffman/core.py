@@ -54,6 +54,32 @@ def _caller_source_file() -> Optional[str]:
     return inspect.currentframe().f_back.f_back.f_globals.get('__file__')
 
 
+#Env vars set by the common MPI launchers. We sniff env rather than
+#importing mpi4py because importing mpi4py has the side effect of
+#calling MPI_Init, which is too aggressive for an opt-in convenience
+#layer. Order doesn't matter — the first one present wins.
+_MPI_RANK_VARS = (
+    'PMI_RANK',              # MPICH / Cray MPICH (NERSC, ALCF)
+    'OMPI_COMM_WORLD_RANK',  # OpenMPI
+    'MV2_COMM_WORLD_RANK',   # MVAPICH2
+    'SLURM_PROCID',          # Slurm srun (no explicit MPI launcher)
+    'MPI_LOCALRANKID',       # Intel MPI
+)
+
+
+def _mpi_rank() -> int:
+    """Return this process's MPI rank, or 0 outside an MPI job."""
+    for var in _MPI_RANK_VARS:
+        v = os.environ.get(var)
+        if v is None:
+            continue
+        try:
+            return int(v)
+        except ValueError:
+            continue
+    return 0
+
+
 def _try_snapshot(root: str, source_file: str, message: str) -> None:
     """Best-effort git snapshot of a pipeline / chain source file.
 
@@ -61,7 +87,14 @@ def _try_snapshot(root: str, source_file: str, message: str) -> None:
     so failures don't propagate. They DO get logged at WARNING on every
     occurrence — git_backup itself logs the specific git stderr; this
     layer just ensures a snapshot failure never aborts a run.
+
+    Under MPI, only rank 0 runs the snapshot; other ranks would race on
+    the same `<root>/_scripts/.git` repo (one of them would `git init`
+    while another is mid-commit) and there is nothing for them to add
+    beyond what rank 0 already commits.
     """
+    if _mpi_rank() != 0:
+        return
     try:
         from .git_backup import snapshot
         snapshot(root, source_file, message)
