@@ -1584,16 +1584,17 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
 
     # --- renderers -------------------------------------------------------
     @app.get('/api/render')
-    def _render(path: str):
+    def _render(path: str, target_max: int = 512):
         if not _safe_under(path, app.state.registry.root):
             raise HTTPException(status_code=400, detail='path escape')
-        return renderers.render(path)
+        return renderers.render(path, target_max=target_max)
 
     @app.get('/api/render_dataset')
-    def _render_dataset(path: str, dataset: str):
+    def _render_dataset(path: str, dataset: str, target_max: int = 512):
         if not _safe_under(path, app.state.registry.root):
             raise HTTPException(status_code=400, detail='path escape')
-        return renderers.render_h5_dataset(path, dataset)
+        return renderers.render_h5_dataset(path, dataset,
+                                           target_max=target_max)
 
     @app.get('/api/srw_preview')
     def _srw_preview(path: str,

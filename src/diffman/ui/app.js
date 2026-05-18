@@ -1854,12 +1854,9 @@ const App = {
                             type: 'scatter', mode: 'lines'}],
                      {margin: {t: 20, l: 50, r: 20, b: 40}});
     } else if (k === 'plot_2d') {
-      const div = el('div', {class: 'plot'});
-      container.appendChild(div);
-      Plotly.newPlot(div, [{z: payload.data, type: 'heatmap',
-                            colorscale: 'Viridis'}],
-                     {margin: {t: 20, l: 50, r: 20, b: 40},
-                      title: m.stats ? `min=${fmt(m.stats.min)} max=${fmt(m.stats.max)} mean=${fmt(m.stats.mean)}` : ''});
+      this.renderPlot2D(container, payload,
+                        tmax => '/api/render?path=' + encodeURIComponent(artifact.absolute)
+                                + '&target_max=' + tmax);
     } else if (k === 'h5_tree') {
       const ul = el('ul');
       for (const ds of payload.data) {
@@ -1889,7 +1886,8 @@ const App = {
   async renderSRW(container, path) {
     container.innerHTML = '';
     const state = {path, repr: 'intensity', polarization: 'both',
-                   energy_slice: -1, row: -1, col: -1, available: null};
+                   energy_slice: -1, row: -1, col: -1, target_max: 512,
+                   available: null};
     const controls = el('div', {class: 'row', style: 'margin-bottom:8px'});
     const reprSel = el('select', {});
     const polSel = el('select', {});
@@ -1898,9 +1896,13 @@ const App = {
     polSel.appendChild(el('option', {value: 'Ey',   text: 'Ey only'}));
     const eIdx = el('input', {type: 'number', value: '-1', style: 'width:80px',
                               title: 'energy slice (-1 = sum/center)'});
+    const tmaxInput = el('input', {type: 'number', value: '512', min: '32',
+                                   step: '64', style: 'width:80px',
+                                   title: 'max pixels per side before heatmap downsampling'});
     controls.appendChild(el('label', {}, ['repr: '])); controls.appendChild(reprSel);
     controls.appendChild(el('label', {}, [' polarization: '])); controls.appendChild(polSel);
     controls.appendChild(el('label', {}, [' E slice: '])); controls.appendChild(eIdx);
+    controls.appendChild(el('label', {}, [' max px: '])); controls.appendChild(tmaxInput);
     container.appendChild(controls);
     const grid = el('div', {style:
       'display:grid;grid-template-columns:2fr 1fr;grid-template-rows:auto auto;gap:8px'});
@@ -1914,7 +1916,8 @@ const App = {
     const fetchAndDraw = async () => {
       const q = new URLSearchParams({
         path, repr: state.repr, polarization: state.polarization,
-        energy_slice: state.energy_slice, row: state.row, col: state.col});
+        energy_slice: state.energy_slice, row: state.row, col: state.col,
+        target_max: state.target_max});
       let payload;
       try { payload = await jget('/api/srw_preview?' + q); }
       catch (e) { meta.textContent = 'preview failed: ' + e; return; }
@@ -1934,7 +1937,8 @@ const App = {
       const ys = linspace(mesh.yStart, mesh.yFin, z.length);
       Plotly.react(heatDiv, [{z, x: xs, y: ys, type: 'heatmap', colorscale: 'Viridis'}], {
         margin: {t: 24, l: 50, r: 20, b: 40},
-        xaxis: {title: 'x [m]'}, yaxis: {title: 'y [m]'},
+        xaxis: {title: 'x [m]', constrain: 'domain'},
+        yaxis: {title: 'y [m]', scaleanchor: 'x', scaleratio: 1},
         title: `${m.srw_kind} · ${m.repr}` +
                (m.downsampled && (m.downsampled[0] > 1 || m.downsampled[1] > 1)
                 ? `  (downsampled ${m.downsampled.join('×')})` : ''),
@@ -1958,6 +1962,10 @@ const App = {
     reprSel.onchange = () => { state.repr = reprSel.value; fetchAndDraw(); };
     polSel.onchange = () => { state.polarization = polSel.value; fetchAndDraw(); };
     eIdx.onchange = () => { state.energy_slice = parseInt(eIdx.value || '-1', 10); fetchAndDraw(); };
+    tmaxInput.onchange = () => {
+      state.target_max = Math.max(32, parseInt(tmaxInput.value, 10) || 512);
+      fetchAndDraw();
+    };
     fetchAndDraw();
   },
 
@@ -1967,7 +1975,8 @@ const App = {
     //up the same way (click in the heatmap to move the cross-hair).
     container.innerHTML = '';
     const state = {path, kind: 'obj', storage: '', mode: 0,
-                   repr: 'amplitude', row: -1, col: -1, summary: null};
+                   repr: 'amplitude', row: -1, col: -1, target_max: 512,
+                   summary: null};
     const controls = el('div', {class: 'row', style: 'margin-bottom:8px'});
     const kindSel = el('select');
     kindSel.appendChild(el('option', {value: 'obj',   text: 'object'}));
@@ -1978,10 +1987,14 @@ const App = {
     for (const r of ['amplitude', 'phase', 'real', 'imag', 'intensity'])
       reprSel.appendChild(el('option', {value: r, text: r}));
     reprSel.value = 'amplitude';
+    const tmaxInput = el('input', {type: 'number', value: '512', min: '32',
+                                   step: '64', style: 'width:80px',
+                                   title: 'max pixels per side before heatmap downsampling'});
     controls.appendChild(el('label', {}, ['kind: ']));    controls.appendChild(kindSel);
     controls.appendChild(el('label', {}, [' storage: '])); controls.appendChild(storSel);
     controls.appendChild(el('label', {}, [' mode: ']));   controls.appendChild(modeSel);
     controls.appendChild(el('label', {}, [' repr: ']));   controls.appendChild(reprSel);
+    controls.appendChild(el('label', {}, [' max px: '])); controls.appendChild(tmaxInput);
     container.appendChild(controls);
 
     const grid = el('div', {style:
@@ -2025,7 +2038,8 @@ const App = {
       const q = new URLSearchParams({
         path, kind: state.kind, storage: state.storage,
         mode: state.mode, repr: state.repr,
-        row: state.row, col: state.col});
+        row: state.row, col: state.col,
+        target_max: state.target_max});
       let payload;
       try { payload = await jget('/api/ptyr_preview?' + q); }
       catch (e) { meta.textContent = 'preview failed: ' + e; return; }
@@ -2126,11 +2140,18 @@ const App = {
       state.mode = parseInt(modeSel.value, 10) || 0; fetchAndDraw();
     };
     reprSel.onchange = () => { state.repr = reprSel.value; fetchAndDraw(); };
+    tmaxInput.onchange = () => {
+      state.target_max = Math.max(32, parseInt(tmaxInput.value, 10) || 512);
+      fetchAndDraw();
+    };
     fetchAndDraw();
   },
 
   async renderH5Dataset(container, path, dataset) {
-    const payload = await jget(`/api/render_dataset?path=${encodeURIComponent(path)}&dataset=${encodeURIComponent(dataset)}`);
+    const url = tmax => `/api/render_dataset?path=${encodeURIComponent(path)}`
+                        + `&dataset=${encodeURIComponent(dataset)}`
+                        + `&target_max=${tmax}`;
+    const payload = await jget(url(512));
     const wrap = el('div', {class: 'artifact'});
     wrap.appendChild(el('div', {class: 'header'}, [
       el('span', {class: 'path', text: dataset}),
@@ -2144,13 +2165,58 @@ const App = {
       Plotly.newPlot(div, [{x: payload.data.x, y: payload.data.y, type: 'scatter', mode: 'lines'}],
         {margin: {t: 20, l: 50, r: 20, b: 40}});
     } else if (payload.kind === 'plot_2d') {
-      const div = el('div', {class: 'plot'}); body.appendChild(div);
-      Plotly.newPlot(div, [{z: payload.data, type: 'heatmap', colorscale: 'Viridis'}],
-        {margin: {t: 20, l: 50, r: 20, b: 40}});
+      this.renderPlot2D(body, payload, url);
     } else if (payload.kind === 'scalar') {
       body.appendChild(el('pre', {text: String(payload.data)}));
     } else {
       body.appendChild(el('pre', {text: JSON.stringify(payload, null, 2)}));
+    }
+  },
+
+  renderPlot2D(container, payload, urlForTmax) {
+    //Shared 2D heatmap preview. Square pixels (scaleanchor) so 256×512
+    //arrays don't render as a square. `urlForTmax(n)` returns the fetch
+    //URL when the user changes the max-pixels input — pass null to make
+    //the input read-only (no re-fetch supported).
+    const m = payload.meta || {};
+    const initial = (m.downsampled && Math.max(m.downsampled[0], m.downsampled[1]) > 1)
+      ? Math.max(...m.shape) / Math.max(m.downsampled[0], m.downsampled[1])
+      : Math.max(...(m.shape || [512]));
+    const tmaxStart = Math.max(64, Math.round(initial));
+    const controls = el('div', {class: 'row', style: 'margin-bottom:4px;gap:4px;align-items:center'});
+    const tmaxInput = el('input', {type: 'number', value: String(tmaxStart),
+      min: '32', step: '64', style: 'width:80px',
+      title: 'max pixels per side before heatmap downsampling'});
+    controls.appendChild(el('label', {class: 'hint'}, ['max pixels: ']));
+    controls.appendChild(tmaxInput);
+    container.appendChild(controls);
+    const div = el('div', {class: 'plot'});
+    container.appendChild(div);
+    const draw = (p) => {
+      const meta = p.meta || {};
+      const ds = (meta.downsampled && (meta.downsampled[0] > 1 || meta.downsampled[1] > 1))
+        ? `  (downsampled ${meta.downsampled.join('×')})` : '';
+      const stats = meta.stats
+        ? `min=${fmt(meta.stats.min)} max=${fmt(meta.stats.max)} mean=${fmt(meta.stats.mean)}` : '';
+      Plotly.react(div, [{z: p.data, type: 'heatmap', colorscale: 'Viridis'}], {
+        margin: {t: 24, l: 50, r: 20, b: 40},
+        xaxis: {constrain: 'domain'},
+        yaxis: {scaleanchor: 'x', scaleratio: 1},
+        title: stats + ds,
+      });
+    };
+    draw(payload);
+    if (urlForTmax) {
+      tmaxInput.onchange = async () => {
+        const v = Math.max(32, parseInt(tmaxInput.value, 10) || 512);
+        tmaxInput.disabled = true;
+        try {
+          const next = await jget(urlForTmax(v));
+          if (next.kind === 'plot_2d') draw(next);
+        } finally { tmaxInput.disabled = false; }
+      };
+    } else {
+      tmaxInput.disabled = true;
     }
   },
 };

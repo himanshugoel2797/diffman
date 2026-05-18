@@ -39,11 +39,13 @@ except ImportError:
 # Dispatch
 # ---------------------------------------------------------------------------
 
-def render(path: str, *, max_bytes: int = 4_000_000) -> dict:
+def render(path: str, *, max_bytes: int = 4_000_000,
+           target_max: int = 512) -> dict:
     """Render a single artifact file into a UI-consumable payload.
 
     :param path: absolute path to the file.
     :param max_bytes: cap for raw text/binary preview size.
+    :param target_max: cap on max(2D-shape) before heatmap downsampling.
     """
     if not os.path.isfile(path):
         return {'kind': 'error', 'data': 'file not found', 'meta': {'path': path}}
@@ -72,7 +74,7 @@ def render(path: str, *, max_bytes: int = 4_000_000) -> dict:
         if ext in {'.png', '.jpg', '.jpeg', '.gif', '.svg'}:
             return _render_image(path, meta)
         if ext == '.npy':
-            return _render_npy(path, meta)
+            return _render_npy(path, meta, target_max=target_max)
         if ext in {'.h5', '.hdf5', '.ptyd'}:
             return _render_h5(path, meta)
         if ext == '.json':
@@ -115,9 +117,9 @@ def _render_json(path, meta, max_bytes):
     return {'kind': 'json', 'data': obj, 'meta': meta}
 
 
-def _render_npy(path, meta):
+def _render_npy(path, meta, *, target_max: int = 512):
     arr = np.load(path, mmap_mode='r', allow_pickle=False)
-    return _array_payload(arr, meta)
+    return _array_payload(arr, meta, target_max=target_max)
 
 
 def _render_h5(path, meta):
@@ -140,7 +142,8 @@ def _render_h5(path, meta):
 
 
 def render_h5_dataset(path: str, dataset: str, *,
-                      max_points: int = 200_000) -> dict:
+                      max_points: int = 200_000,
+                      target_max: int = 512) -> dict:
     """Render a specific HDF5 dataset."""
     if not _HAS_H5PY:
         return {'kind': 'error', 'data': 'h5py not installed',
@@ -163,10 +166,10 @@ def render_h5_dataset(path: str, dataset: str, *,
             meta['decimated_stride'] = stride
         else:
             data = ds[...]
-        return _array_payload(data, meta)
+        return _array_payload(data, meta, target_max=target_max)
 
 
-def _array_payload(arr, meta: dict) -> dict:
+def _array_payload(arr, meta: dict, *, target_max: int = 512) -> dict:
     """Convert a numpy array into a plot-friendly payload.
 
     Heuristics:
@@ -189,7 +192,6 @@ def _array_payload(arr, meta: dict) -> dict:
             meta['decimated_stride'] = stride
         return {'kind': 'plot_1d', 'data': {'x': x, 'y': y}, 'meta': meta}
     if a.ndim == 2:
-        target_max = 512
         if max(a.shape) > target_max:
             sy = int(np.ceil(a.shape[0] / target_max))
             sx = int(np.ceil(a.shape[1] / target_max))
@@ -210,4 +212,4 @@ def _array_payload(arr, meta: dict) -> dict:
         return {'kind': 'plot_2d', 'data': a2.tolist(), 'meta': meta}
     #ndim >= 3 -> show first slice as 2D heatmap.
     meta['note'] = f'showing arr[0] of shape {list(a.shape)}'
-    return _array_payload(a[0], meta)
+    return _array_payload(a[0], meta, target_max=target_max)
