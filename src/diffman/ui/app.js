@@ -195,15 +195,26 @@ const App = {
     }
     if (this._lastSigs[viewKey] === sig) return;
     this._lastSigs[viewKey] = sig;
-    //Data changed — repaint via the original show*() entry points.
+    //Data changed — repaint via the original show*() entry points. Snap
+    //the current scroll position before clearing #main and restore it
+    //after the rebuild so a 2.5s repaint backstop doesn't jump the page
+    //back to the top mid-read. requestAnimationFrame waits one frame
+    //past Plotly's async layout so the document height is final.
+    const scroller = document.scrollingElement || document.documentElement;
+    const scrollTop = scroller.scrollTop;
+    let p;
     if (cur.kind === 'chain') {
-      this.showChain(cur.name, cur.variation);
+      p = this.showChain(cur.name, cur.variation);
     } else if (cur.kind === 'run') {
-      this.showRun(cur.pipeline, cur.variant, cur.short_fp);
+      p = this.showRun(cur.pipeline, cur.variant, cur.short_fp);
     } else if (cur.kind === 'stage') {
-      this.showStage(cur.pipeline, cur.variant, cur.short_fp, cur.stage);
+      p = this.showStage(cur.pipeline, cur.variant, cur.short_fp, cur.stage);
     } else if (cur.kind === 'stale') {
-      this.showStaleRuns();
+      p = this.showStaleRuns();
+    }
+    if (p && typeof p.then === 'function') {
+      try { await p; } catch (_) {}
+      requestAnimationFrame(() => { scroller.scrollTop = scrollTop; });
     }
   },
 
@@ -975,6 +986,7 @@ const App = {
   },
 
   async showChainDiff(name) {
+    this.current = {kind: 'chain_diff', name};
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `Variation diff — ${name} vs parent chain`}));
     let d;
@@ -1019,6 +1031,7 @@ const App = {
   },
 
   async showChainSourceDiff(name) {
+    this.current = {kind: 'chain_source_diff', name};
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `Chain source diff — ${name} vs parent`}));
     let d;
@@ -1038,6 +1051,7 @@ const App = {
   },
 
   showChainVariationPicker(chainName, variations) {
+    this.current = {kind: 'chain_variation_picker', name: chainName};
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `Compare variations — ${chainName}`}));
     main.appendChild(el('p', {class: 'hint',
@@ -1063,6 +1077,7 @@ const App = {
   },
 
   async showChainVariationDiff(chainName, variations) {
+    this.current = {kind: 'chain_variation_diff', name: chainName};
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2',
       {text: `Compare variations — ${chainName}: ${variations.join(' / ')}`}));
@@ -1107,6 +1122,10 @@ const App = {
   },
 
   async showScoreboard(chainName, baseline) {
+    //Anchor this.current to a kind with no _repaintEndpoint so unrelated
+    //WS run_changed events (which would otherwise repaint the stale
+    //previous view via _repaintCurrent) leave the scoreboard intact.
+    this.current = {kind: 'scoreboard', name: chainName, baseline: baseline || null};
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `Scoreboard — ${chainName}`}));
     const url = '/api/scoreboard/' + encodeURIComponent(chainName)
@@ -1419,6 +1438,7 @@ const App = {
     //Show every other run of the same (pipeline, variant) tuple and let
     //the user pick one to diff against. /api/run_diff explains where the
     //stage cache keys diverged.
+    this.current = {kind: 'why_rerun', pipeline, variant, short_fp};
     const runs = (await jget('/api/runs?pipeline=' + encodeURIComponent(pipeline)
       + '&variant=' + encodeURIComponent(variant))).runs;
     const others = runs.filter(r => r.short_fp !== short_fp);
@@ -1448,6 +1468,7 @@ const App = {
   },
 
   async showRunDiff(pipeline, variant, a, b) {
+    this.current = {kind: 'run_diff', pipeline, variant, short_fp: a};
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2',
       {text: `Run diff — ${pipeline}/${variant}  ${a} vs ${b}`}));
@@ -1535,6 +1556,11 @@ const App = {
     });
     if (wasSameStage && this._lastStageSig === sig) return;
     this._lastStageSig = sig;
+    //Snapshot any currently-expanded preview cards so we can transplant
+    //their bodies back into the re-rendered list. Without this, a WS
+    //run_changed event (e.g. another stage finishing) collapses every
+    //open preview and forces a re-fetch.
+    const preserved = wasSameStage ? this._snapshotArtifactCards() : new Map();
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `${pipeline} / ${variant} / ${stage}`,
                                title: short_fp}));
@@ -1563,8 +1589,18 @@ const App = {
       text: `${d.artifacts.length} output${d.artifacts.length === 1 ? '' : 's'} ` +
             '— click a row to preview.'}));
     for (const a of d.artifacts) {
-      const card = el('div', {class: 'artifact collapsed'});
-      const caret = el('span', {class: 'caret', text: '▶'});
+      const prev = preserved.get(a.path);
+      //Reuse the prior preview body only if the artifact's size hasn't
+      //changed — otherwise the bytes have shifted under us and the
+      //preview is stale. Path-only match keeps the card expanded; the
+      //user can click to re-load.
+      const sameBytes = prev && prev.size === a.size;
+      const startExpanded = !!(prev && prev.isExpanded);
+      const card = el('div',
+        {class: 'artifact' + (startExpanded ? '' : ' collapsed')});
+      card.dataset.size = String(a.size);
+      const caret = el('span',
+        {class: 'caret', text: startExpanded ? '▼' : '▶'});
       const header = el('div', {class: 'header clickable'}, [
         caret,
         el('span', {class: 'path', text: a.path}),
@@ -1576,21 +1612,57 @@ const App = {
           onclick: ev => { ev.stopPropagation();
                            this.diffArtifactPrompt(a); }}),
       ]);
-      const body = el('div', {class: 'body', style: 'display:none'});
-      let loaded = false;
+      let body, loaded;
+      if (sameBytes && prev.body) {
+        body = prev.body;       //transplant the rendered preview as-is
+        loaded = prev.loaded;
+      } else {
+        body = el('div', {class: 'body'});
+        loaded = false;
+      }
+      body.style.display = startExpanded ? '' : 'none';
+      if (loaded) card.dataset.loaded = '1';
       header.onclick = () => {
         const isCollapsed = card.classList.toggle('collapsed');
         caret.textContent = isCollapsed ? '▶' : '▼';
         body.style.display = isCollapsed ? 'none' : '';
         if (!isCollapsed && !loaded) {
           loaded = true;
+          card.dataset.loaded = '1';
           this.renderArtifact(body, a, {pipeline, variant, short_fp});
         }
       };
       card.appendChild(header);
       card.appendChild(body);
       main.appendChild(card);
+      //If we kept the card expanded but the bytes changed, reload eagerly
+      //so the user sees fresh content instead of a stale preview.
+      if (startExpanded && !sameBytes) {
+        loaded = true;
+        card.dataset.loaded = '1';
+        this.renderArtifact(body, a, {pipeline, variant, short_fp});
+      }
     }
+  },
+
+  _snapshotArtifactCards() {
+    //Capture per-path expansion state and the rendered body DOM node so
+    //showStage can transplant them after rebuilding the artifact list.
+    //Size is captured to detect stale previews when the file changed.
+    const out = new Map();
+    const cards = $('#main').querySelectorAll(':scope > .artifact');
+    for (const card of cards) {
+      const pathEl = card.querySelector(':scope > .header > .path');
+      if (!pathEl) continue;
+      const body = card.querySelector(':scope > .body');
+      out.set(pathEl.textContent, {
+        isExpanded: !card.classList.contains('collapsed'),
+        loaded: card.dataset.loaded === '1',
+        size: card.dataset.size ? parseInt(card.dataset.size, 10) : null,
+        body,
+      });
+    }
+    return out;
   },
 
   async diffArtifactPrompt(artifact) {
