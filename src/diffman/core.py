@@ -113,6 +113,37 @@ def mpi_rank() -> int:
     return _mpi_rank()
 
 
+def _mpi_any(local: bool) -> bool:
+    """Return True iff any rank's local value is True.
+
+    With mpi4py imported and initialized, this is an allreduce-LOR over
+    COMM_WORLD. Without mpi4py, returns the caller's local value
+    unchanged — single-process semantics, same opt-in posture as
+    `mpi_barrier()` (we never trigger the mpi4py import ourselves).
+
+    Used by `Pipeline.run` to reach all-rank consensus on whether any
+    rank raised inside `stage.fn`, so a partial failure (rank 0 succeeds,
+    rank N fails) cannot leave behind a `_key` marking the stage as
+    cached. Without this, the next invocation would treat the stage as
+    complete and skip recomputation — the bug class this exists to
+    prevent.
+    """
+    import sys
+    if 'mpi4py.MPI' not in sys.modules and 'mpi4py' not in sys.modules:
+        return local
+    try:
+        from mpi4py import MPI
+        if MPI.Is_initialized() and not MPI.Is_finalized():
+            return bool(MPI.COMM_WORLD.allreduce(bool(local), op=MPI.LOR))
+    except Exception:
+        #An allreduce failure shouldn't escalate beyond the caller's
+        #local view. Worst case: a partial failure leaves a cache no
+        #worse than today's racy behavior, and the next run will recompute
+        #once the user clears the bogus key.
+        pass
+    return local
+
+
 def _clear_path(p: str) -> None:
     """Remove `p` if it exists, handling files, symlinks, and directories.
 
@@ -355,19 +386,28 @@ def _maybe_migrate_legacy_key(stage: 'Stage', new_key: str,
     #new scheme — next lookup hits the fast path and the stale meta is
     #harmless (only /api/run_diff reads components.fn, and a one-side
     #mismatch surfaces there as "fn_changed" until the next migration).
-    tmp_key = stage_dir / '_key.tmp'
-    tmp_key.write_text(new_key)
-    os.replace(tmp_key, key_file)
-    meta['components'] = new_components
-    meta['key'] = new_key
-    meta['migrated_from'] = {
-        'scheme': 'source-text-sha256',
-        'fn': cached_fn,
-        'key': legacy_key,
-    }
-    tmp_meta = stage_dir / '_meta.json.tmp'
-    tmp_meta.write_text(json.dumps(meta, indent=2, default=str))
-    os.replace(tmp_meta, meta_path)
+    #
+    #Under MPI only rank 0 performs the rewrite; non-zero ranks return
+    #the legacy_key so their caller's downstream-upstream alias map
+    #lines up with rank 0's, but skip the file I/O. This avoids two
+    #ranks racing on `os.replace` of the same `_key` (POSIX rename is
+    #atomic, but the `tmp_key.write_text` -> `os.replace` window is
+    #wide enough for one rank's tmp file to be replaced out from under
+    #another rank mid-rename on some networked FS).
+    if _mpi_rank() == 0:
+        tmp_key = stage_dir / '_key.tmp'
+        tmp_key.write_text(new_key)
+        os.replace(tmp_key, key_file)
+        meta['components'] = new_components
+        meta['key'] = new_key
+        meta['migrated_from'] = {
+            'scheme': 'source-text-sha256',
+            'fn': cached_fn,
+            'key': legacy_key,
+        }
+        tmp_meta = stage_dir / '_meta.json.tmp'
+        tmp_meta.write_text(json.dumps(meta, indent=2, default=str))
+        os.replace(tmp_meta, meta_path)
     return legacy_key
 
 
@@ -616,27 +656,71 @@ class Pipeline:
             ctx.record.stage_status[stage.name] = 'running'
             registry._flush(ctx.record)
             t0 = time.time()
+            #Capture exceptions locally rather than re-raising immediately:
+            #under MPI, every rank must reach the `_mpi_any` consensus
+            #point below so we can agree on whether the stage as a whole
+            #succeeded. A rank that raises before consensus would leave
+            #the surviving ranks free to write `_key`, producing a
+            #cached-but-incomplete stage on disk — exactly the race this
+            #block defends against.
+            local_exc: Optional[Exception] = None
+            local_tb: Optional[str] = None
             try:
                 stage.fn(ctx)
-                #_meta.json records both the terminal key AND its three
-                #inputs (fn / config / upstream) so /api/run_diff can
-                #attribute a cache miss to which input changed.
+            except Exception as e:
+                local_exc = e
+                local_tb = traceback.format_exc()
+
+            #Cross-rank consensus on stage failure. If any rank raised,
+            #NO rank writes `_key` — the cache key is the durable record
+            #that the stage's outputs are valid, and a partial failure
+            #invalidates that for every rank, not just the one that
+            #failed.
+            stage_failed = _mpi_any(local_exc is not None)
+
+            if stage_failed:
+                ctx.record.stage_status[stage.name] = 'failed'
+                ctx.record.errors[stage.name] = local_tb or (
+                    f'aborted: another MPI rank raised in stage '
+                    f'{stage.name!r}; see that rank\'s traceback for '
+                    f'the cause')
+                registry._flush(ctx.record)
+                #Barrier before re-raising so rank 0's failure-state
+                #flush is durable before any rank tears down the job —
+                #otherwise MPI.Abort() (triggered by an unhandled
+                #exception in a non-zero rank) can race rank 0's
+                #run.json write.
+                mpi_barrier()
+                if local_exc is not None:
+                    raise local_exc
+                raise RuntimeError(
+                    f'stage {self.name}/{stage.name}: another MPI rank '
+                    f"raised; see that rank's traceback for the cause")
+
+            #All ranks succeeded. Rank 0 owns the cache write; non-zero
+            #ranks update in-memory state and wait at the barrier so
+            #downstream cache-checks see the committed `_key`.
+            #
+            #_meta.json records both the terminal key AND its three
+            #inputs (fn / config / upstream) so /api/run_diff can
+            #attribute a cache miss to which input changed.
+            if _mpi_rank() == 0:
                 (stage_dir / '_meta.json').write_text(json.dumps(
                     {'name': stage.name, 'key': key,
                      'started': t0, 'ended': time.time(),
                      'components': components}, indent=2, default=str))
-                #Mark done and persist BEFORE writing `_key`, so a crash
-                #between the two leaves the stage looking incomplete
-                #(re-runnable) rather than cached-but-`running`.
-                ctx.record.stage_status[stage.name] = 'done'
-                registry._flush(ctx.record)
-                key_file.write_text(key)
-            except Exception:
-                ctx.record.stage_status[stage.name] = 'failed'
-                ctx.record.errors[stage.name] = traceback.format_exc()
-                registry._flush(ctx.record)
-                raise
+            ctx.record.stage_status[stage.name] = 'done'
+            #Mark done and persist BEFORE writing `_key`, so a crash
+            #between the two leaves the stage looking incomplete
+            #(re-runnable) rather than cached-but-`running`.
             registry._flush(ctx.record)
+            if _mpi_rank() == 0:
+                key_file.write_text(key)
+            #Barrier so non-zero ranks don't proceed to the next stage
+            #(or return from the pipeline) before `_key` is committed —
+            #otherwise a downstream stage in the same chain could see a
+            #not-yet-cached upstream when reading `_key` from disk.
+            mpi_barrier()
 
         ctx.record.ended = _now()
         registry._flush(ctx.record)
@@ -1112,6 +1196,9 @@ class RunRegistry:
         upstream = upstream or {}
         run_fp = _run_fingerprint(variant, upstream)
         fdir = os.path.join(self.root, pipeline, variant.name, run_fp[:12])
+        #makedirs is idempotent and race-safe with exist_ok=True, so every
+        #rank can call it — keeps the `fdir` directory existing before any
+        #rank tries to write into it.
         os.makedirs(fdir, exist_ok=True)
         record = RunRecord(
             pipeline=pipeline, variant=variant.name,
@@ -1121,13 +1208,28 @@ class RunRegistry:
             upstream={n: r.fingerprint for n, r in upstream.items()},
         )
         self._flush(record)
-        Path(fdir, 'config.json').write_text(
-            json.dumps(variant.config, indent=2, default=str))
+        #Under MPI only rank 0 owns the on-disk run state; non-zero ranks
+        #compute the same record in-memory but don't write. Skipping the
+        #config.json write here matches `_flush`'s gating and keeps all
+        #per-run files single-writer.
+        if _mpi_rank() == 0:
+            Path(fdir, 'config.json').write_text(
+                json.dumps(variant.config, indent=2, default=str))
         return RunContext(fdir, variant, record, upstream=upstream)
 
     def _flush(self, record: RunRecord) -> None:
-        Path(record.fdir, 'run.json').write_text(
-            json.dumps(asdict(record), indent=2, default=str))
+        """Persist `record` to `run.json` and invalidate the list cache.
+
+        Under MPI only rank 0 writes — every rank constructs the same
+        RunRecord from the same inputs, so 112 ranks each writing
+        run.json is pure contention with no information gain (and a
+        torn-write hazard on networked filesystems). The in-process
+        `_cache` invalidation still runs on every rank because each
+        rank has its own RunRegistry instance with its own cache.
+        """
+        if _mpi_rank() == 0:
+            Path(record.fdir, 'run.json').write_text(
+                json.dumps(asdict(record), indent=2, default=str))
         self._cache = None
 
     def _load_all(self) -> list[RunRecord]:

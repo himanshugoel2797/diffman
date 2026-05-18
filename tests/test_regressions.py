@@ -455,3 +455,225 @@ def test_api_compare_handles_failed_module(scan_root, make_pipeline):
     assert by_path['y']['equal'] is True
     # Column alignment preserved.
     assert by_path['x']['values'][1] is None
+
+
+# ---------------------------------------------------------------------------
+# core.py: under MPI, every rank used to race on stage cache writes
+# (`_meta.json`, `_key`, `run.json`, `config.json`). The killer case:
+# rank 0 raised in stage.fn while non-zero ranks succeeded (their slice
+# of distributed work was a no-op), and the non-zero ranks wrote `_key`
+# anyway — marking a failed stage as cached. The next invocation then
+# treated the stage as complete and skipped recomputation. The user hit
+# this three times before we systematically gated every stage cache
+# write to rank 0 with a `_mpi_any` failure consensus.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def _mpi_rank_env(monkeypatch):
+    """Reset every recognized MPI-rank env var so tests start at rank 0."""
+    from diffman import core
+    for var in core._MPI_RANK_VARS:
+        monkeypatch.delenv(var, raising=False)
+    return monkeypatch
+
+
+def test_stage_cache_files_only_written_by_rank_zero(scan_root, _mpi_rank_env):
+    """Non-zero ranks must not write `_meta.json`, `_key`, `run.json`, or
+    `config.json`. Pre-fix every rank wrote them, racing on `os.replace`
+    and producing torn files on networked FS."""
+    from diffman import core
+    _mpi_rank_env.setenv('SLURM_PROCID', '7')
+
+    sim_calls = []
+
+    def sim(ctx):
+        sim_calls.append(core._mpi_rank())
+
+    reg = core.RunRegistry(root=str(scan_root / 'runs'))
+    v = core.registry.register('only', module='_diffman_test_rank_writes', x=1)
+    pipe = core.Pipeline('_pipe_rank_writes', [core.Stage('sim', sim)])
+    pipe.run(v, reg)
+
+    # stage.fn still runs on every rank (distributed-work invariant).
+    assert sim_calls == [7]
+
+    # ...but none of the cache/registry files exist.
+    run_dir = list((scan_root / 'runs' / '_pipe_rank_writes' / 'only').iterdir())
+    assert len(run_dir) == 1
+    rd = run_dir[0]
+    assert not (rd / 'run.json').exists()
+    assert not (rd / 'config.json').exists()
+    assert not (rd / 'stages' / 'sim' / '_key').exists()
+    assert not (rd / 'stages' / 'sim' / '_meta.json').exists()
+
+
+def test_stage_cache_written_by_rank_zero(scan_root, _mpi_rank_env):
+    """Confirm the positive path: rank 0 still writes everything."""
+    from diffman import core
+    _mpi_rank_env.setenv('SLURM_PROCID', '0')
+
+    def sim(ctx):
+        pass
+
+    reg = core.RunRegistry(root=str(scan_root / 'runs'))
+    v = core.registry.register('only', module='_diffman_test_rank_zero', x=1)
+    pipe = core.Pipeline('_pipe_rank_zero', [core.Stage('sim', sim)])
+    pipe.run(v, reg)
+
+    rd = next((scan_root / 'runs' / '_pipe_rank_zero' / 'only').iterdir())
+    assert (rd / 'run.json').exists()
+    assert (rd / 'config.json').exists()
+    assert (rd / 'stages' / 'sim' / '_key').exists()
+    assert (rd / 'stages' / 'sim' / '_meta.json').exists()
+
+
+def test_stage_key_not_written_when_a_peer_rank_fails(scan_root,
+                                                       _mpi_rank_env,
+                                                       monkeypatch):
+    """The headline bug: on a multi-rank invocation, a successful rank
+    used to write `_key` even though another rank had raised in the
+    same stage. Pin rank 0 to "succeeded locally" and force the
+    consensus helper to report a peer failure — `_key` must NOT appear,
+    and Pipeline.run must raise.
+    """
+    from diffman import core
+    _mpi_rank_env.setenv('SLURM_PROCID', '0')
+
+    #Simulate `mpi4py.allreduce(LOR)` returning True (peer rank failed)
+    #without the local rank having raised — the cross-rank consensus
+    #path that the env-only rank check cannot detect on its own.
+    monkeypatch.setattr(core, '_mpi_any', lambda local: True)
+
+    def sim(ctx):
+        return  # local success
+
+    reg = core.RunRegistry(root=str(scan_root / 'runs'))
+    v = core.registry.register('only', module='_diffman_test_peer_fail', x=1)
+    pipe = core.Pipeline('_pipe_peer_fail', [core.Stage('sim', sim)])
+    with pytest.raises(RuntimeError, match='another MPI rank'):
+        pipe.run(v, reg)
+
+    rd = next((scan_root / 'runs' / '_pipe_peer_fail' / 'only').iterdir())
+    assert not (rd / 'stages' / 'sim' / '_key').exists(), (
+        '_key written despite peer-rank failure — the stage would now '
+        'be treated as cached on re-invocation')
+
+
+def test_local_failure_propagates_with_traceback(scan_root, _mpi_rank_env):
+    """When the local rank itself raises, the original exception must
+    propagate — we route through `_mpi_any` consensus but don't swallow
+    the traceback."""
+    from diffman import core
+    _mpi_rank_env.setenv('SLURM_PROCID', '0')
+
+    def sim(ctx):
+        raise ValueError('boom from stage fn')
+
+    reg = core.RunRegistry(root=str(scan_root / 'runs'))
+    v = core.registry.register('only', module='_diffman_test_local_fail', x=1)
+    pipe = core.Pipeline('_pipe_local_fail', [core.Stage('sim', sim)])
+    with pytest.raises(ValueError, match='boom from stage fn'):
+        pipe.run(v, reg)
+
+    rd = next((scan_root / 'runs' / '_pipe_local_fail' / 'only').iterdir())
+    assert not (rd / 'stages' / 'sim' / '_key').exists()
+
+
+def test_mpi_any_returns_local_without_mpi4py(_mpi_rank_env):
+    """The opt-in posture mirrors `mpi_barrier`: never import mpi4py
+    ourselves, single-process semantics when it isn't loaded."""
+    import sys
+    from diffman import core
+    if 'mpi4py' in sys.modules or 'mpi4py.MPI' in sys.modules:
+        pytest.skip('mpi4py already imported earlier in session')
+    assert core._mpi_any(False) is False
+    assert core._mpi_any(True) is True
+    assert 'mpi4py' not in sys.modules
+    assert 'mpi4py.MPI' not in sys.modules
+
+
+def test_mpi_any_calls_allreduce_when_mpi4py_present(monkeypatch):
+    """With mpi4py imported and initialized, `_mpi_any` must delegate to
+    `MPI.COMM_WORLD.allreduce(local, op=MPI.LOR)` — the actual mechanism
+    by which failure consensus is reached."""
+    import sys
+    from diffman import core
+    calls = []
+
+    class FakeCommWorld:
+        def allreduce(self, value, op):
+            calls.append((value, op))
+            return True  # simulate "some rank had local=True"
+
+    class FakeMPI:
+        LOR = 'LOR-sentinel'
+        COMM_WORLD = FakeCommWorld()
+
+        @staticmethod
+        def Is_initialized():
+            return True
+
+        @staticmethod
+        def Is_finalized():
+            return False
+
+    fake_mpi4py = type(sys)('mpi4py')
+    fake_mpi4py.MPI = FakeMPI
+    monkeypatch.setitem(sys.modules, 'mpi4py', fake_mpi4py)
+    monkeypatch.setitem(sys.modules, 'mpi4py.MPI', FakeMPI)
+    assert core._mpi_any(False) is True
+    assert calls == [(False, 'LOR-sentinel')]
+
+
+def test_legacy_key_migration_writes_only_on_rank_zero(scan_root,
+                                                        _mpi_rank_env):
+    """`_maybe_migrate_legacy_key` rewrites `_key` and `_meta.json` in
+    place. Under MPI only rank 0 should touch the filesystem; non-zero
+    ranks return the legacy_key for alias bookkeeping without writing.
+    """
+    from diffman import core
+    from pathlib import Path
+
+    def sim(ctx):
+        pass
+
+    #First run as rank 0 to seed a legacy-scheme cache. We do this by
+    #running normally, then rewriting `_key`/`_meta.json` to the legacy
+    #fn-hash to simulate "this cache was written by an older diffman".
+    _mpi_rank_env.setenv('SLURM_PROCID', '0')
+    reg = core.RunRegistry(root=str(scan_root / 'runs'))
+    v = core.registry.register('only', module='_diffman_test_legacy_mig', x=1)
+    pipe = core.Pipeline('_pipe_legacy_mig', [core.Stage('sim', sim)])
+    pipe.run(v, reg)
+
+    rd = next((scan_root / 'runs' / '_pipe_legacy_mig' / 'only').iterdir())
+    stage_dir = rd / 'stages' / 'sim'
+    meta_path = stage_dir / '_meta.json'
+    key_path = stage_dir / '_key'
+
+    #Rewrite to legacy scheme.
+    components = core.Stage('sim', sim).key_components(v, {})
+    components['fn'] = core._fn_source_hash_legacy(sim)
+    legacy_key = core.fingerprint({'stage': 'sim', **components})
+    meta = json.loads(meta_path.read_text())
+    meta['components'] = components
+    meta['key'] = legacy_key
+    meta_path.write_text(json.dumps(meta))
+    key_path.write_text(legacy_key)
+    meta_mtime_before = meta_path.stat().st_mtime_ns
+    key_mtime_before = key_path.stat().st_mtime_ns
+
+    #Now invoke as a non-zero rank. The cache check should still find
+    #the entry migratable (return value lets the in-memory aliasing
+    #work), but no files on disk should change.
+    _mpi_rank_env.setenv('SLURM_PROCID', '5')
+    import time as _time
+    _time.sleep(0.01)  # ensure mtime would tick if a write happened
+    pipe.run(v, reg)
+
+    assert meta_path.stat().st_mtime_ns == meta_mtime_before, (
+        '_meta.json was rewritten by a non-zero rank')
+    assert key_path.stat().st_mtime_ns == key_mtime_before, (
+        '_key was rewritten by a non-zero rank')
+    assert key_path.read_text() == legacy_key, (
+        '_key contents mutated by non-zero rank migration')
