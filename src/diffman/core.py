@@ -1075,16 +1075,35 @@ class RunContext:
 class RunRegistry:
     """Owns the on-disk layout: <root>/<pipeline>/<variant>/<fp>/...
 
-    `list_runs()` caches its result; call `invalidate()` (or let the
-    server's watchdog do it) after any filesystem change under `root`.
+    `list_runs()` caches its result with a short TTL so the server still
+    picks up changes when the filesystem watcher misses events — common
+    on networked filesystems like Lustre, where inotify often doesn't
+    fire for writes from a different host or process tree. Callers that
+    know a change just happened can still call ``invalidate()`` (the
+    in-process pipeline runner and the watcher both do).
     """
+
+    #Conservative default. Long enough that a refreshing UI doesn't
+    #re-walk the runs tree on every request; short enough that a running
+    #stage's status flips from `running` to `cached`/`done` on screen
+    #within a beat or two. Tunable via the ``DIFFMAN_LIST_RUNS_TTL`` env
+    #var for users with very large runs trees.
+    _DEFAULT_TTL_S = 1.0
 
     def __init__(self, root: str = 'runs'):
         self.root = root
         self._cache: Optional[list['RunRecord']] = None
+        self._cache_at: float = 0.0
+        try:
+            self._cache_ttl = float(
+                os.environ.get('DIFFMAN_LIST_RUNS_TTL',
+                               self._DEFAULT_TTL_S))
+        except ValueError:
+            self._cache_ttl = self._DEFAULT_TTL_S
 
     def invalidate(self) -> None:
         self._cache = None
+        self._cache_at = 0.0
 
     def open_run(self, pipeline: str, variant: Variant, *,
                  upstream: Optional[dict] = None,
@@ -1127,8 +1146,11 @@ class RunRegistry:
         return out
 
     def list_runs(self, *, pipeline=None, variant=None) -> list[RunRecord]:
-        if self._cache is None:
+        now = time.time()
+        if (self._cache is None
+                or now - self._cache_at > self._cache_ttl):
             self._cache = self._load_all()
+            self._cache_at = now
         items = self._cache
         if pipeline:
             items = [r for r in items if r.pipeline == pipeline]

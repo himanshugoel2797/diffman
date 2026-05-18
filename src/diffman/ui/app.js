@@ -33,6 +33,34 @@ const App = {
     this.connectWS();
     await this.refresh();
     setInterval(() => this.refresh(), 7000);
+    //Backstop polling for the open main view. Watchdog/inotify is
+    //unreliable on networked filesystems like Lustre — when the
+    //compute-node process writing run.json is on a different host than
+    //the diffman server, the FS event often never reaches the watcher
+    //and the WebSocket stays silent. Repainting at a steady interval
+    //keeps `running` → `cached` transitions visible without a manual
+    //reload. The registry's own list_runs() TTL ensures we don't burn
+    //a directory walk on every tick.
+    setInterval(() => this._repaintCurrent(), 2500);
+  },
+
+  //Re-render whichever main view is open, by calling the same show*
+  //method that initially populated it. Used by both the WS handler
+  //(when an event arrives) and the periodic backstop. Skips static
+  //views (pipeline overview, variant overrides, find results) that
+  //don't reflect live run state.
+  _repaintCurrent() {
+    const cur = this.current;
+    if (!cur) return;
+    if (cur.kind === 'chain') {
+      this.showChain(cur.name, cur.variation);
+    } else if (cur.kind === 'stale') {
+      this.showStaleRuns();
+    } else if (cur.kind === 'run') {
+      this.showRun(cur.pipeline, cur.variant, cur.short_fp);
+    } else if (cur.kind === 'stage') {
+      this.showStage(cur.pipeline, cur.variant, cur.short_fp, cur.stage);
+    }
   },
 
   connectWS() {
@@ -59,16 +87,17 @@ const App = {
 
   handleRunChanged(ev) {
     this.refresh();
-    if (this.current && this.current.kind === 'run' &&
-        this.current.pipeline === ev.pipeline &&
-        this.current.variant === ev.variant &&
-        this.current.short_fp === ev.fp) {
-      this.showRun(ev.pipeline, ev.variant, ev.fp);
-    } else if (this.current && this.current.kind === 'stage' &&
-               this.current.pipeline === ev.pipeline &&
-               this.current.variant === ev.variant &&
-               this.current.short_fp === ev.fp) {
-      this.showStage(ev.pipeline, ev.variant, ev.fp, this.current.stage);
+    //For run/stage views, only repaint if the event names this run —
+    //avoids flicker when an unrelated run finishes. Chain/stale views
+    //don't filter (any chain step could flip a status). Anything else
+    //falls through to _repaintCurrent below.
+    const cur = this.current;
+    if (cur && (cur.kind === 'run' || cur.kind === 'stage')
+        && cur.pipeline === ev.pipeline && cur.variant === ev.variant
+        && cur.short_fp === ev.fp) {
+      this._repaintCurrent();
+    } else if (cur && (cur.kind === 'chain' || cur.kind === 'stale')) {
+      this._repaintCurrent();
     }
   },
 
