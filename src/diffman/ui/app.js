@@ -32,6 +32,13 @@ const App = {
   async init() {
     this.connectWS();
     await this.refresh();
+    //Route from the URL after the sidebar has loaded — otherwise an
+    //initial show* call would race the pipeline forest population.
+    this._routeFromUrl();
+    //Back/forward through browser history. The state object stashed on
+    //pushState/replaceState carries enough to re-render without
+    //re-parsing the URL, but _routeFromUrl works either way.
+    window.addEventListener('popstate', () => this._routeFromUrl());
     setInterval(() => this.refresh(), 7000);
     //Backstop polling for the open main view. Watchdog/inotify is
     //unreliable on networked filesystems like Lustre — when the
@@ -44,22 +51,159 @@ const App = {
     setInterval(() => this._repaintCurrent(), 2500);
   },
 
-  //Re-render whichever main view is open, by calling the same show*
-  //method that initially populated it. Used by both the WS handler
-  //(when an event arrives) and the periodic backstop. Skips static
-  //views (pipeline overview, variant overrides, find results) that
-  //don't reflect live run state.
-  _repaintCurrent() {
+  //URL routing — query-string-encoded view state so links can be copied,
+  //opened in a new tab, and survive a page reload. The encoding mirrors
+  //`this.current`: `view=<kind>` plus the identifying params for that
+  //kind. show* methods call _syncUrl to keep the URL in sync; _repaintCurrent
+  //calls show* too, but the URL is identical so we replaceState (no history
+  //pollution).
+  _kindParams: {
+    pipeline: ['module'],
+    variant:  ['module', 'variant'],
+    chain:    ['name', 'variation'],
+    run:      ['pipeline', 'variant', 'short_fp'],
+    stage:    ['pipeline', 'variant', 'short_fp', 'stage'],
+    disk:     [],
+    stale:    [],
+  },
+
+  _buildUrl(state) {
+    if (!state || !state.kind) return location.pathname;
+    const params = new URLSearchParams();
+    params.set('view', state.kind);
+    for (const f of (this._kindParams[state.kind] || [])) {
+      const v = state[f];
+      if (v != null && v !== '') params.set(f, v);
+    }
+    return location.pathname + '?' + params.toString();
+  },
+
+  _syncUrl(state) {
+    //Called by every show* method after it has set this.current. If the
+    //resulting URL matches the current one (the polling backstop, or a
+    //popstate re-route), replaceState keeps history clean; otherwise
+    //pushState adds an entry so back/forward works.
+    const url = this._buildUrl(state);
+    const here = location.pathname + location.search;
+    if (url === here) {
+      history.replaceState(state, '', url);
+    } else {
+      history.pushState(state, '', url);
+      //New view — drop any cached signature for it. show*() is about to
+      //render fresh data; the next poll will re-establish the signature
+      //and skip the redundant repaint. Without this, returning to a
+      //previously-visited view would trigger one stale-signature repaint
+      //before settling.
+      if (this._lastSigs) delete this._lastSigs[this._viewKey(state)];
+    }
+  },
+
+  _routeFromUrl() {
+    const params = new URLSearchParams(location.search);
+    const view = params.get('view');
+    if (!view) return;
+    //Each branch calls the corresponding show* method, which sets
+    //this.current and (re-)syncs the URL — replaceState since we're
+    //already at this URL, so no history change.
+    if (view === 'pipeline' && params.get('module')) {
+      this.showPipeline(params.get('module'));
+    } else if (view === 'variant' && params.get('module')
+               && params.get('variant')) {
+      this.showVariant(params.get('module'), params.get('variant'));
+    } else if (view === 'chain' && params.get('name')) {
+      this.showChain(params.get('name'),
+                     params.get('variation') || undefined);
+    } else if (view === 'run' && params.get('pipeline')
+               && params.get('variant') && params.get('short_fp')) {
+      this.showRun(params.get('pipeline'), params.get('variant'),
+                   params.get('short_fp'));
+    } else if (view === 'stage' && params.get('pipeline')
+               && params.get('variant') && params.get('short_fp')
+               && params.get('stage')) {
+      this.showStage(params.get('pipeline'), params.get('variant'),
+                     params.get('short_fp'), params.get('stage'));
+    } else if (view === 'disk') {
+      this.showDiskUsage();
+    } else if (view === 'stale') {
+      this.showStaleRuns();
+    }
+  },
+
+  //Re-render whichever main view is open, but only when the underlying
+  //data has actually changed since the last poll. Used by both the WS
+  //handler (when an event arrives) and the periodic backstop.
+  //
+  //Strategy: fetch the view's primary endpoint, hash the response (via
+  //JSON.stringify), and compare against the last stored signature for
+  //this view. Skip the full show*() repaint when the signature matches
+  //— this avoids the constant DOM flicker the naive every-2.5s repaint
+  //caused. When signatures differ, call show*() which will fetch again
+  //(duplicate request, but only on real changes).
+  //
+  //Static views (pipeline overview, variant overrides, find results,
+  //disk usage) don't poll — _repaintEndpoint returns null for those.
+  _viewKey(state) {
+    if (!state || !state.kind) return null;
+    return JSON.stringify([
+      state.kind,
+      state.module, state.variant, state.name, state.variation,
+      state.pipeline, state.short_fp, state.stage,
+    ]);
+  },
+
+  _repaintEndpoint(cur) {
+    if (cur.kind === 'chain') {
+      //A chain without a selected variation has nothing live to poll —
+      //the chain metadata (variations list, parent) only changes on
+      //pipeline source edits, which trigger pipelines_changed instead.
+      if (!cur.variation) return null;
+      return `/api/chain_progress/${encodeURIComponent(cur.name)}`
+           + `/${encodeURIComponent(cur.variation)}`;
+    }
+    if (cur.kind === 'run') {
+      return `/api/run/${encodeURIComponent(cur.pipeline)}`
+           + `/${encodeURIComponent(cur.variant)}`
+           + `/${encodeURIComponent(cur.short_fp)}`;
+    }
+    if (cur.kind === 'stage') {
+      return `/api/stage/${encodeURIComponent(cur.pipeline)}`
+           + `/${encodeURIComponent(cur.variant)}`
+           + `/${encodeURIComponent(cur.short_fp)}`
+           + `/${encodeURIComponent(cur.stage)}`;
+    }
+    if (cur.kind === 'stale') return '/api/stale_runs';
+    return null;
+  },
+
+  async _repaintCurrent() {
     const cur = this.current;
     if (!cur) return;
+    const endpoint = this._repaintEndpoint(cur);
+    if (!endpoint) return;
+    let data;
+    try { data = await jget(endpoint); }
+    catch (_) { return; }
+    const sig = JSON.stringify(data);
+    const viewKey = this._viewKey(cur);
+    this._lastSigs = this._lastSigs || {};
+    if (this._lastSigs[viewKey] == null) {
+      //First poll since navigating to this view: show*() has already
+      //rendered the current data, so just record the signature and skip
+      //the redundant repaint. Subsequent polls compare against it.
+      this._lastSigs[viewKey] = sig;
+      return;
+    }
+    if (this._lastSigs[viewKey] === sig) return;
+    this._lastSigs[viewKey] = sig;
+    //Data changed — repaint via the original show*() entry points.
     if (cur.kind === 'chain') {
       this.showChain(cur.name, cur.variation);
-    } else if (cur.kind === 'stale') {
-      this.showStaleRuns();
     } else if (cur.kind === 'run') {
       this.showRun(cur.pipeline, cur.variant, cur.short_fp);
     } else if (cur.kind === 'stage') {
       this.showStage(cur.pipeline, cur.variant, cur.short_fp, cur.stage);
+    } else if (cur.kind === 'stale') {
+      this.showStaleRuns();
     }
   },
 
@@ -215,6 +359,7 @@ const App = {
 
   async showPipeline(module) {
     this.current = {kind: 'pipeline', module};
+    this._syncUrl(this.current);
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: module}));
 
@@ -312,6 +457,7 @@ const App = {
   async showSourceDiff(module) {
     //Keep sidebar highlight on the pipeline we forked from.
     this.current = {kind: 'pipeline', module};
+    this._syncUrl(this.current);
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `Source diff — ${module} vs parent`}));
     main.appendChild(el('p', {}, [
@@ -451,6 +597,7 @@ const App = {
 
   async showVariant(module, variant) {
     this.current = {kind: 'variant', module, variant};
+    this._syncUrl(this.current);
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `${module} / ${variant}`}));
     main.appendChild(el('p', {}, [
@@ -530,6 +677,7 @@ const App = {
 
   async showChain(name, variationName) {
     this.current = {kind: 'chain', name, variation: variationName || null};
+    this._syncUrl(this.current);
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: `chain: ${name}`}));
     let d;
@@ -1012,6 +1160,7 @@ const App = {
 
   async showDiskUsage() {
     this.current = {kind: 'disk'};
+    this._syncUrl(this.current);
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: 'Disk usage'}));
     let d;
@@ -1054,6 +1203,7 @@ const App = {
     //actions — surfacing only. The user navigates to the run dir on
     //disk (or to the run detail page) and decides what to do.
     this.current = {kind: 'stale'};
+    this._syncUrl(this.current);
     const main = $('#main'); main.innerHTML = '';
     main.appendChild(el('h2', {text: 'Stale runs'}));
     main.appendChild(el('p', {class: 'hint',
@@ -1175,6 +1325,7 @@ const App = {
 
   async showRun(pipeline, variant, short_fp) {
     this.current = {kind: 'run', pipeline, variant, short_fp};
+    this._syncUrl(this.current);
     let d;
     try {
       d = await jget(`/api/run/${encodeURIComponent(pipeline)}/${encodeURIComponent(variant)}/${encodeURIComponent(short_fp)}`);
@@ -1366,6 +1517,7 @@ const App = {
       && this.current.short_fp === short_fp
       && this.current.stage === stage;
     this.current = {kind: 'stage', pipeline, variant, short_fp, stage};
+    this._syncUrl(this.current);
     let d;
     try {
       d = await jget(`/api/stage/${encodeURIComponent(pipeline)}/${encodeURIComponent(variant)}/${encodeURIComponent(short_fp)}/${encodeURIComponent(stage)}`);
