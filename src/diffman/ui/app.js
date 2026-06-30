@@ -1959,7 +1959,7 @@ const App = {
     container.innerHTML = '';
     const state = {path, repr: 'intensity', polarization: 'both',
                    energy_slice: -1, row: -1, col: -1, target_max: 512,
-                   available: null};
+                   log: false, available: null};
     const controls = el('div', {class: 'row', style: 'margin-bottom:8px'});
     const reprSel = el('select', {});
     const polSel = el('select', {});
@@ -1971,10 +1971,13 @@ const App = {
     const tmaxInput = el('input', {type: 'number', value: '512', min: '32',
                                    step: '64', style: 'width:80px',
                                    title: 'max pixels per side before heatmap downsampling'});
+    const logChk = el('input', {type: 'checkbox',
+                                title: 'log10 colorscale + log y-axis on cuts'});
     controls.appendChild(el('label', {}, ['repr: '])); controls.appendChild(reprSel);
     controls.appendChild(el('label', {}, [' polarization: '])); controls.appendChild(polSel);
     controls.appendChild(el('label', {}, [' E slice: '])); controls.appendChild(eIdx);
     controls.appendChild(el('label', {}, [' max px: '])); controls.appendChild(tmaxInput);
+    controls.appendChild(el('label', {style: 'margin-left:8px'}, [logChk, ' log']));
     container.appendChild(controls);
     const grid = el('div', {style:
       'display:grid;grid-template-columns:2fr 1fr;grid-template-rows:auto auto;gap:8px'});
@@ -2004,14 +2007,16 @@ const App = {
         const isWavefield = m.srw_kind === 'wavefield';
         polSel.disabled = !isWavefield; eIdx.disabled = !isWavefield;
       }
-      const z = payload.data.z, cut = payload.data.cut, mesh = m.mesh;
+      const zRaw = payload.data.z, cut = payload.data.cut, mesh = m.mesh;
+      const z = state.log ? applyLog10(zRaw) : zRaw;
       const xs = linspace(mesh.xStart, mesh.xFin, z[0].length);
       const ys = linspace(mesh.yStart, mesh.yFin, z.length);
+      const cutYAxis = state.log ? {type: 'log'} : {};
       Plotly.react(heatDiv, [{z, x: xs, y: ys, type: 'heatmap', colorscale: 'Viridis'}], {
         margin: {t: 24, l: 50, r: 20, b: 40},
         xaxis: {title: 'x [m]', constrain: 'domain'},
         yaxis: {title: 'y [m]', scaleanchor: 'x', scaleratio: 1},
-        title: `${m.srw_kind} · ${m.repr}` +
+        title: `${m.srw_kind} · ${m.repr}${state.log ? ' (log10)' : ''}` +
                (m.downsampled && (m.downsampled[0] > 1 || m.downsampled[1] > 1)
                 ? `  (downsampled ${m.downsampled.join('×')})` : ''),
         shapes: [
@@ -2020,9 +2025,11 @@ const App = {
         ],
       });
       Plotly.react(hcutDiv, [{x: xs, y: cut.h, type: 'scatter', mode: 'lines', line: {color: '#c0392b'}}],
-        {margin: {t: 20, l: 50, r: 20, b: 30}, title: `horizontal cut @ row=${cut.row}`, xaxis: {title: 'x [m]'}});
+        {margin: {t: 20, l: 50, r: 20, b: 30}, title: `horizontal cut @ row=${cut.row}`,
+         xaxis: {title: 'x [m]'}, yaxis: cutYAxis});
       Plotly.react(vcutDiv, [{x: ys, y: cut.v, type: 'scatter', mode: 'lines', line: {color: '#c0392b'}}],
-        {margin: {t: 20, l: 50, r: 20, b: 30}, title: `vertical cut @ col=${cut.col}`, xaxis: {title: 'y [m]'}});
+        {margin: {t: 20, l: 50, r: 20, b: 30}, title: `vertical cut @ col=${cut.col}`,
+         xaxis: {title: 'y [m]'}, yaxis: cutYAxis});
       meta.textContent = `mesh: ${mesh.nx}×${mesh.ny}  E=[${mesh.eStart}, ${mesh.eFin}] eV (ne=${mesh.ne})  ·  ${m.note || ''}`;
       heatDiv.removeAllListeners?.();
       heatDiv.on('plotly_click', ev => {
@@ -2038,6 +2045,7 @@ const App = {
       state.target_max = Math.max(32, parseInt(tmaxInput.value, 10) || 512);
       fetchAndDraw();
     };
+    logChk.onchange = () => { state.log = logChk.checked; fetchAndDraw(); };
     fetchAndDraw();
   },
 
@@ -2048,7 +2056,7 @@ const App = {
     container.innerHTML = '';
     const state = {path, kind: 'obj', storage: '', mode: 0,
                    repr: 'amplitude', row: -1, col: -1, target_max: 512,
-                   summary: null};
+                   log: false, summary: null};
     const controls = el('div', {class: 'row', style: 'margin-bottom:8px'});
     const kindSel = el('select');
     kindSel.appendChild(el('option', {value: 'obj',   text: 'object'}));
@@ -2062,11 +2070,14 @@ const App = {
     const tmaxInput = el('input', {type: 'number', value: '512', min: '32',
                                    step: '64', style: 'width:80px',
                                    title: 'max pixels per side before heatmap downsampling'});
+    const logChk = el('input', {type: 'checkbox',
+                                title: 'log10 colorscale + log y-axis on cuts'});
     controls.appendChild(el('label', {}, ['kind: ']));    controls.appendChild(kindSel);
     controls.appendChild(el('label', {}, [' storage: '])); controls.appendChild(storSel);
     controls.appendChild(el('label', {}, [' mode: ']));   controls.appendChild(modeSel);
     controls.appendChild(el('label', {}, [' repr: ']));   controls.appendChild(reprSel);
     controls.appendChild(el('label', {}, [' max px: '])); controls.appendChild(tmaxInput);
+    controls.appendChild(el('label', {style: 'margin-left:8px'}, [logChk, ' log']));
     container.appendChild(controls);
 
     const grid = el('div', {style:
@@ -2133,7 +2144,8 @@ const App = {
         }
         drawConvergence(state.summary.iter_info);
       }
-      const z = payload.data.z, cut = payload.data.cut;
+      const zRaw = payload.data.z, cut = payload.data.cut;
+      const z = state.log ? applyLog10(zRaw) : zRaw;
       //Axes in microns relative to origin. psize/origin are in metres.
       const ny = z.length, nx = z[0].length;
       const sy = (m.downsampled && m.downsampled[0]) || 1;
@@ -2147,11 +2159,12 @@ const App = {
       const ys = new Array(ny);
       for (let j = 0; j < ny; j++) ys[j] = (oy + j * sy * py) * 1e6;
       const ds = (sy > 1 || sx > 1) ? `  (downsampled ${sy}×${sx})` : '';
+      const cutYAxis = state.log ? {type: 'log'} : {};
       Plotly.react(heatDiv, [{z, x: xs, y: ys, type: 'heatmap',
                               colorscale: state.repr === 'phase' ? 'HSV' : 'Viridis'}], {
         margin: {t: 24, l: 50, r: 20, b: 40},
         xaxis: {title: 'x [µm]'}, yaxis: {title: 'y [µm]', scaleanchor: 'x'},
-        title: `${m.kind} · ${m.storage} · mode ${m.mode}/${m.nmodes - 1} · ${m.repr}${ds}`,
+        title: `${m.kind} · ${m.storage} · mode ${m.mode}/${m.nmodes - 1} · ${m.repr}${state.log ? ' (log10)' : ''}${ds}`,
         shapes: [
           {type:'line', x0:xs[cut.col], x1:xs[cut.col], y0:ys[0], y1:ys[ys.length-1], line:{color:'red', width:1}},
           {type:'line', y0:ys[cut.row], y1:ys[cut.row], x0:xs[0], x1:xs[xs.length-1], line:{color:'red', width:1}},
@@ -2160,11 +2173,13 @@ const App = {
       Plotly.react(hcutDiv, [{x: xs, y: cut.h, type: 'scatter', mode: 'lines',
                               line: {color: '#c0392b'}}],
         {margin: {t: 20, l: 50, r: 20, b: 30},
-         title: `horizontal cut @ row=${cut.row}`, xaxis: {title: 'x [µm]'}});
+         title: `horizontal cut @ row=${cut.row}`,
+         xaxis: {title: 'x [µm]'}, yaxis: cutYAxis});
       Plotly.react(vcutDiv, [{x: ys, y: cut.v, type: 'scatter', mode: 'lines',
                               line: {color: '#c0392b'}}],
         {margin: {t: 20, l: 50, r: 20, b: 30},
-         title: `vertical cut @ col=${cut.col}`, xaxis: {title: 'y [µm]'}});
+         title: `vertical cut @ col=${cut.col}`,
+         xaxis: {title: 'y [µm]'}, yaxis: cutYAxis});
       const psStr = (m.psize || []).map(v => fmt(v)).join(' × ');
       meta.textContent =
         `shape: ${(m.shape || []).join('×')}  ·  pixel size: ${psStr} m  ` +
@@ -2216,6 +2231,7 @@ const App = {
       state.target_max = Math.max(32, parseInt(tmaxInput.value, 10) || 512);
       fetchAndDraw();
     };
+    logChk.onchange = () => { state.log = logChk.checked; fetchAndDraw(); };
     fetchAndDraw();
   },
 
@@ -2259,32 +2275,39 @@ const App = {
     const tmaxInput = el('input', {type: 'number', value: String(tmaxStart),
       min: '32', step: '64', style: 'width:80px',
       title: 'max pixels per side before heatmap downsampling'});
+    const logChk = el('input', {type: 'checkbox',
+                                title: 'log10 colorscale'});
     controls.appendChild(el('label', {class: 'hint'}, ['max pixels: ']));
     controls.appendChild(tmaxInput);
+    controls.appendChild(el('label', {class: 'hint', style: 'margin-left:8px'},
+                            [logChk, ' log']));
     container.appendChild(controls);
     const div = el('div', {class: 'plot'});
     container.appendChild(div);
+    let last = payload;
     const draw = (p) => {
       const meta = p.meta || {};
       const ds = (meta.downsampled && (meta.downsampled[0] > 1 || meta.downsampled[1] > 1))
         ? `  (downsampled ${meta.downsampled.join('×')})` : '';
       const stats = meta.stats
         ? `min=${fmt(meta.stats.min)} max=${fmt(meta.stats.max)} mean=${fmt(meta.stats.mean)}` : '';
-      Plotly.react(div, [{z: p.data, type: 'heatmap', colorscale: 'Viridis'}], {
+      const z = logChk.checked ? applyLog10(p.data) : p.data;
+      Plotly.react(div, [{z, type: 'heatmap', colorscale: 'Viridis'}], {
         margin: {t: 24, l: 50, r: 20, b: 40},
         xaxis: {constrain: 'domain'},
         yaxis: {scaleanchor: 'x', scaleratio: 1},
-        title: stats + ds,
+        title: stats + (logChk.checked ? '  (log10)' : '') + ds,
       });
     };
     draw(payload);
+    logChk.onchange = () => draw(last);
     if (urlForTmax) {
       tmaxInput.onchange = async () => {
         const v = Math.max(32, parseInt(tmaxInput.value, 10) || 512);
         tmaxInput.disabled = true;
         try {
           const next = await jget(urlForTmax(v));
-          if (next.kind === 'plot_2d') draw(next);
+          if (next.kind === 'plot_2d') { last = next; draw(next); }
         } finally { tmaxInput.disabled = false; }
       };
     } else {
@@ -2294,16 +2317,11 @@ const App = {
 };
 
 function _runStatus(r) {
-  //Derive an overall run status from per-stage statuses. failed > running
-  //> pending > done — whichever's strongest "wins" — so a partially-
-  //failed run reads as 'failed' at a glance.
-  const ss = r.stage_status || {};
-  const vals = Object.values(ss);
-  if (!vals.length) return 'pending';
-  if (vals.some(s => s === 'failed')) return 'failed';
-  if (vals.some(s => s === 'running')) return 'running';
-  if (vals.some(s => s === 'pending')) return 'pending';
-  return 'done';
+  //Status is rolled up server-side (_summarize_stage_status) and shipped
+  //on every run summary, so the rollup lives in exactly one place and the
+  //runs list can't disagree with the chain DAG / scoreboard. Fall back to
+  //'pending' only if an older payload lacks the field.
+  return r.status || 'pending';
 }
 
 function renderUnifiedDiff(text) {
@@ -2346,6 +2364,27 @@ function linspace(a, b, n) {
   const step = (b - a) / (n - 1);
   const out = new Array(n);
   for (let i = 0; i < n; i++) out[i] = a + i * step;
+  return out;
+}
+function applyLog10(z) {
+  //Floor non-positive values at ~12 decades below max-abs so log10 stays
+  //finite; signed reprs (phase/real/imag) collapse to the floor where
+  //they're non-positive, which is intentional — toggle off for those.
+  let zmax = 0;
+  for (const row of z) {
+    for (const v of row) {
+      const a = Math.abs(v);
+      if (a > zmax) zmax = a;
+    }
+  }
+  const floor = Math.max(zmax * 1e-12, Number.MIN_VALUE);
+  const out = new Array(z.length);
+  for (let i = 0; i < z.length; i++) {
+    const row = z[i];
+    const o = new Array(row.length);
+    for (let j = 0; j < row.length; j++) o[j] = Math.log10(Math.max(row[j], floor));
+    out[i] = o;
+  }
   return out;
 }
 function artifactHref(p, v, fp, rel) {

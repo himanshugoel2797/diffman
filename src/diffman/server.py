@@ -57,7 +57,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import discovery, renderers
-from .core import (RunRegistry, fingerprint,
+from .core import (RunRegistry, fingerprint, _run_fingerprint,
                    _fn_source_hash_legacy,
                    registry as _global_registry)
 
@@ -173,6 +173,41 @@ def _chain_meta(chain) -> dict:
     }
 
 
+def _expected_run_fp(step, variant_name, upstream_records):
+    """The run fingerprint the CURRENT config produces for `step`: the
+    variant fingerprint folded with the resolved upstream RunRecords —
+    byte-for-byte the value core execution uses to name the run dir
+    (``core._run_fingerprint``). Returns None only when the variant can't
+    be resolved from the registry, signalling the caller to fall back to a
+    looser name+upstream match.
+    """
+    try:
+        variant_obj = _global_registry.get(step.pipeline._module,
+                                            variant_name)
+        return _run_fingerprint(variant_obj, upstream_records)
+    except Exception:
+        return None
+
+
+def _find_chain_run(all_runs, step, expected_fp, variant_name, required):
+    """The on-disk run for one chain step. Matched by the fingerprint the
+    current config produces (authoritative — identical to what core writes
+    on execution); only when that fingerprint is unavailable does it fall
+    back to (variant name + upstream fps). This is the SINGLE match rule
+    shared by both variation resolvers, so the chain-progress / scoreboard
+    join cannot drift from core or from each other.
+    """
+    for r in all_runs:
+        if r.pipeline != step.pipeline.name:
+            continue
+        if expected_fp is not None:
+            if r.fingerprint == expected_fp:
+                return r
+        elif r.variant == variant_name and r.upstream == required:
+            return r
+    return None
+
+
 def _resolve_variation_runs(chain, variation, all_runs) -> dict:
     """For each step in `chain`, locate the run that belongs to
     `variation` by matching pipeline + variant + the upstream fingerprints
@@ -203,15 +238,12 @@ def _resolve_variation_runs(chain, variation, all_runs) -> dict:
         if any(v is None for v in required.values()):
             upstream_fps[step.name] = None
             continue
-        for r in all_runs:
-            if (r.pipeline == step.pipeline.name
-                    and r.variant == variant_name
-                    and r.upstream == required):
-                runs[step.name] = r
-                upstream_fps[step.name] = r.fingerprint
-                break
-        else:
-            upstream_fps[step.name] = None
+        expected_fp = _expected_run_fp(
+            step, variant_name, {u: runs[u] for u in step.consumes})
+        match = _find_chain_run(
+            all_runs, step, expected_fp, variant_name, required)
+        runs[step.name] = match
+        upstream_fps[step.name] = match.fingerprint if match else None
     return runs
 
 
@@ -275,12 +307,21 @@ def _resolve_variation_branches(chain, variation, all_runs) -> dict:
                     ready = False
             run = None
             if ready:
-                for r in all_runs:
-                    if (r.pipeline == step.pipeline.name
-                            and r.variant == vname
-                            and r.upstream == required):
-                        run = r
-                        break
+                #Resolve this branch's upstream RunRecords, then defer to
+                #the SAME matcher the single-record resolver uses, so the
+                #per-branch and single-record joins stay identical.
+                up_recs = {}
+                for u in step.consumes:
+                    ue = branches[u]
+                    if len(ue) == 1 and ue[0]['branch_key'] is None:
+                        up_recs[u] = ue[0]['run']
+                    else:
+                        up_recs[u] = next(
+                            (e['run'] for e in ue
+                             if e['branch_key'] == bk), None)
+                expected_fp = _expected_run_fp(step, vname, up_recs)
+                run = _find_chain_run(
+                    all_runs, step, expected_fp, vname, required)
             entries.append({'branch_key': bk, 'variant': vname, 'run': run})
             fps_for_step[bk] = run.fingerprint if run else None
 
@@ -291,16 +332,25 @@ def _resolve_variation_branches(chain, variation, all_runs) -> dict:
 
 
 def _summarize_stage_status(stage_status: dict) -> str:
-    """Roll a stage_status dict up into a single chain-step status."""
+    """Roll a stage_status dict up into a single status. The ONE rollup in
+    the system — the runs list, chain DAG, and scoreboard all read this
+    (the frontend consumes the value verbatim) so a run can't read
+    differently across views. Core's stage statuses are skipped / cached /
+    running / failed / done (never 'pending'); 'skipped' is neutral (the
+    stage wasn't requested), so it doesn't force a 'mixed' verdict.
+    """
     statuses = set(stage_status.values())
     if 'failed' in statuses:
         return 'failed'
-    if statuses == {'cached'}:
-        return 'cached'
-    if statuses and statuses <= {'done', 'cached'}:
-        return 'done'
+    if 'running' in statuses:
+        return 'running'
+    statuses.discard('skipped')
     if not statuses:
         return 'pending'
+    if statuses == {'cached'}:
+        return 'cached'
+    if statuses <= {'done', 'cached'}:
+        return 'done'
     return 'mixed'
 
 
@@ -1186,6 +1236,8 @@ def create_app(*, root: str = 'runs', scan_root: str = '.',
             'fdir': r.fdir,
             'started': r.started, 'ended': r.ended,
             'stage_status': r.stage_status,
+            #Server-computed rollup so the frontend never re-derives it.
+            'status': _summarize_stage_status(r.stage_status),
         }
 
     @app.get('/api/runs')
